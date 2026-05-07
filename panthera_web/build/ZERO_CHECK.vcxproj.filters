@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="F:\1LWP\Python\Panthera_Workspace\panthera_web\build\CMakeFiles\43e991bdd84804d292ba456eb7cf68c9\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{1E0DDB68-BAF6-3DD7-839B-A6D10B332E18}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

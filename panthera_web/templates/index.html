@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Panthera-HT 调试板 Web 控制</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+    <div class="brand">
+        <span class="brand-dot"></span>
+        <span class="brand-title">Panthera-HT 调试板</span>
+        <span class="brand-sub">Web Control · pybind11</span>
+    </div>
+    <div class="topbar-right">
+        <span id="connBadge" class="badge badge-off">未连接</span>
+        <span id="statTick" class="stat-mini" title="后台轮询频率"></span>
+        <span id="statJitter" class="stat-mini" title="发送抖动"></span>
+        <span id="statRxAge" class="stat-mini" title="最后一次 RX 距今"></span>
+    </div>
+</header>
+
+<main class="container">
+
+    <!-- ====================== 连接 / 全局控制 ====================== -->
+    <section class="card panel">
+        <div class="panel-row">
+            <div class="panel-cell">
+                <label>串口</label>
+                <div class="row-flex">
+                    <select id="portSelect"></select>
+                    <button id="btnRefreshPorts" class="btn btn-ghost" title="刷新串口列表">⟳</button>
+                </div>
+                <small id="portHint" class="hint"></small>
+            </div>
+            <div class="panel-cell narrow">
+                <label>波特率</label>
+                <input id="baudInput" type="number" value="4000000" step="1000000">
+            </div>
+            <div class="panel-cell">
+                <label>配置文件</label>
+                <input id="cfgPath" type="text" placeholder="(默认 motor_example_debug/robot.cfg)">
+            </div>
+            <div class="panel-cell narrow">
+                <label>&nbsp;</label>
+                <div class="row-flex">
+                    <button id="btnConnect"    class="btn btn-primary">连接</button>
+                    <button id="btnDisconnect" class="btn btn-warn" disabled>断开</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel-row top-divider">
+            <div class="panel-cell narrow">
+                <label>速度上限 (转/秒)</label>
+                <input id="velMax" type="number" value="0.05" step="0.01" min="0">
+            </div>
+            <div class="panel-cell narrow">
+                <label>加速度 (转/秒²)</label>
+                <input id="accMax" type="number" value="0.05" step="0.01" min="0">
+            </div>
+            <div class="panel-cell narrow">
+                <label>位置单位</label>
+                <select id="globalUnit">
+                    <option value="turns">turns (圈)</option>
+                    <option value="radians">radians</option>
+                    <option value="degrees">degrees</option>
+                </select>
+            </div>
+            <div class="panel-cell flex1">
+                <label>&nbsp;</label>
+                <div class="row-flex right">
+                    <button id="btnSaveLimits" class="btn btn-secondary" disabled
+                            title="把当前所有运行时限位写回 robot.cfg (重启仍生效)">💾 保存限位到 cfg</button>
+                    <button id="btnHomeAll" class="btn btn-secondary" disabled>全部回零</button>
+                    <button id="btnStopAll" class="btn btn-danger"    disabled>全部停止</button>
+                    <button id="btnCanStat" class="btn btn-ghost"     disabled>CAN 状态</button>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ====================== 电机网格 ====================== -->
+    <section id="motorGrid" class="motor-grid">
+        <div class="empty-hint">尚未连接调试板; 请先在上方选择串口并点击 "连接"。</div>
+    </section>
+
+    <!-- ====================== 日志 ====================== -->
+    <section class="card log-card">
+        <div class="log-header">
+            <span>日志</span>
+            <button id="btnClearLog" class="btn btn-ghost btn-sm">清空</button>
+        </div>
+        <div id="logArea" class="log-area"></div>
+    </section>
+
+</main>
+
+<!-- toast -->
+<div id="toastWrap" class="toast-wrap"></div>
+
+<!-- 模板: 单个电机卡片 -->
+<template id="motorCardTpl">
+    <div class="card motor-card" data-mid="">
+        <div class="motor-card-head">
+            <span class="motor-id">M—</span>
+            <span class="motor-mode-badge mode-0">mode 0</span>
+            <span class="motor-fault-badge"></span>
+            <span class="motor-limit-badge"></span>
+        </div>
+        <div class="motor-readouts">
+            <div><span class="ro-label">pos</span><span class="ro-value pos">—</span></div>
+            <div><span class="ro-label">vel</span><span class="ro-value vel">—</span></div>
+            <div><span class="ro-label">trq</span><span class="ro-value trq">—</span></div>
+        </div>
+        <div class="motor-limit-row">
+            <span class="limit-text">limit: —</span>
+            <button class="btn btn-ghost btn-sm act-limit-toggle"
+                    title="展开/收起 限位标定">▾ 限位</button>
+        </div>
+
+        <!-- 限位标定 (默认收起) -->
+        <div class="limit-cal" hidden>
+            <div class="limit-cal-row">
+                <label class="lc-label">下限 lo</label>
+                <input type="number" class="lim-lo-input" step="0.001">
+                <button class="btn btn-ghost btn-sm act-set-lo-cur"
+                        title="把当前位置设为下限">⇣ 当前→lo</button>
+            </div>
+            <div class="limit-cal-row">
+                <label class="lc-label">上限 hi</label>
+                <input type="number" class="lim-hi-input" step="0.001">
+                <button class="btn btn-ghost btn-sm act-set-hi-cur"
+                        title="把当前位置设为上限">⇡ 当前→hi</button>
+            </div>
+            <div class="limit-cal-row">
+                <button class="btn btn-primary btn-sm act-apply-lim">应用</button>
+                <button class="btn btn-warn    btn-sm act-disable-lim"
+                        title="禁用本关节的软限位">禁用</button>
+                <span class="lc-hint"></span>
+            </div>
+        </div>
+
+        <div class="motor-control">
+            <div class="control-row">
+                <input type="range" class="pos-slider" min="-1" max="1" step="0.001" value="0">
+                <input type="number" class="pos-input" step="0.001" value="0">
+                <span class="pos-unit-label">turns</span>
+            </div>
+            <div class="control-buttons">
+                <button class="btn btn-primary  btn-sm act-move">▶ 移动</button>
+                <button class="btn btn-secondary btn-sm act-zero">◎ 0</button>
+                <button class="btn btn-warn     btn-sm act-stop">■ 停止</button>
+                <button class="btn btn-warn     btn-sm act-brake">⊠ 刹车</button>
+                <button class="btn btn-ghost    btn-sm act-version">i</button>
+                <button class="btn btn-danger   btn-sm act-resetzero" title="把当前位置写为零点">设零</button>
+            </div>
+        </div>
+    </div>
+</template>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

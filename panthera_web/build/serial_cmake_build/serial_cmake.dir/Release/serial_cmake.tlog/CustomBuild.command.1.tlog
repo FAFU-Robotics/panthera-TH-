@@ -1,0 +1,10 @@
+^F:\1LWP\PYTHON\PANTHERA_WORKSPACE\PANTHERA-HT_SDK\PANTHERA_CPP\MOTOR_CPP\THIRD_PART\SERIAL_CMAKE\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SF:/1LWP/Python/Panthera_Workspace/panthera_web -BF:/1LWP/Python/Panthera_Workspace/panthera_web/build --check-stamp-file F:/1LWP/Python/Panthera_Workspace/panthera_web/build/serial_cmake_build/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
