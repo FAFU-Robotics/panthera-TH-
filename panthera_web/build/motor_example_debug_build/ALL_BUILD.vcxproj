@@ -194,6 +194,10 @@ if %errorlevel% neq 0 goto :VCEnd</Command>
       <Project>{987D471E-B778-3DF7-A7E0-08A48B803B34}</Project>
       <Name>13_test_many</Name>
     </ProjectReference>
+    <ProjectReference Include="F:\1LWP\Python\Panthera_Workspace\panthera_web\build\motor_example_debug_build\14_set_limits.vcxproj">
+      <Project>{F2CC3579-07C9-30F4-8337-8AB85554D24E}</Project>
+      <Name>14_set_limits</Name>
+    </ProjectReference>
     <ProjectReference Include="F:\1LWP\Python\Panthera_Workspace\panthera_web\build\motor_example_debug_build\hightorque_serial_debug.vcxproj">
       <Project>{C8FC0F1F-ADBD-3CF9-B1C3-E6BD5A550919}</Project>
       <Name>hightorque_serial_debug</Name>

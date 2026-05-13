@@ -9,7 +9,7 @@
 //    - 结构体: MotorState, CanStatus, PortInfo, Stats, RobotConfig, ManyMotorCmd
 //    - 自由函数: list_serial_ports, find_likely_debug_boards,
 //                to_turns / from_turns, parse_motor_state_int16
-//    - 类 HightorqueSerial: 全部 public 方法
+//    - 类 HightorqueSerial: 全部 public 方法 (含 set_motor_mode / run_control_loop)
 // =============================================================================
 
 #include <pybind11/pybind11.h>
@@ -274,6 +274,11 @@ PYBIND11_MODULE(panthera_motor, m) {
         .def("brake",            &HightorqueSerial::brake, py::arg("motor_id"),
              py::call_guard<py::gil_scoped_release>())
 
+        // 上电默认 mode=0; 一拖多前须切到 0x0A(10). 须在 enable_async_rx 之前调用以便读回执验证.
+        .def("set_motor_mode",   &HightorqueSerial::set_motor_mode,
+             py::arg("motor_id"), py::arg("mode"),
+             py::call_guard<py::gil_scoped_release>())
+
         .def("set_position",     &HightorqueSerial::set_position,
              py::arg("motor_id"), py::arg("pos"), py::arg("unit") = PosUnit::Turns,
              py::call_guard<py::gil_scoped_release>())
@@ -322,6 +327,53 @@ PYBIND11_MODULE(panthera_motor, m) {
         .def("set_timeout", &HightorqueSerial::set_timeout,
              py::arg("motor_id"), py::arg("timeout_ms"),
              py::call_guard<py::gil_scoped_release>())
+
+        // 固定频率控制环 (内部 steady_clock 定时 + 可选 HighResolutionTimer).
+        // on_tick(tick, dt_ms) 返回 False 则正常结束. abort_check 可选, 返回 True 则紧急退出.
+        .def("run_control_loop", [](HightorqueSerial& self,
+                                    double rate_hz,
+                                    const std::vector<int>& stop_motor_ids,
+                                    py::function on_tick,
+                                    py::object abort_check,
+                                    py::object on_exception,
+                                    bool stop_on_finish,
+                                    bool stop_on_abort) -> int {
+            HightorqueSerial::ControlLoopOptions opt;
+            opt.rate_hz         = rate_hz;
+            opt.stop_motor_ids  = stop_motor_ids;
+            opt.stop_on_finish  = stop_on_finish;
+            opt.stop_on_abort   = stop_on_abort;
+            if (!abort_check.is_none()) {
+                py::object ac = py::reinterpret_borrow<py::object>(abort_check);
+                opt.abort_check = [ac]() -> bool {
+                    py::gil_scoped_acquire gil;
+                    return py::cast<bool>(ac());
+                };
+            }
+            if (!on_exception.is_none()) {
+                py::object ox = py::reinterpret_borrow<py::object>(on_exception);
+                opt.on_exception = [ox](const std::exception& e) {
+                    py::gil_scoped_acquire gil;
+                    try {
+                        ox(py::str(e.what()));
+                    } catch (...) {}
+                };
+            }
+            py::object ot = std::move(on_tick);
+            return self.run_control_loop(opt, [ot](int tick, double period_ms) -> bool {
+                py::gil_scoped_acquire gil;
+                py::object r = ot(tick, period_ms);
+                return py::cast<bool>(r);
+            });
+        },
+        py::arg("rate_hz"),
+        py::arg("stop_motor_ids"),
+        py::arg("on_tick"),
+        py::arg("abort_check") = py::none(),
+        py::arg("on_exception") = py::none(),
+        py::arg("stop_on_finish") = false,
+        py::arg("stop_on_abort") = true,
+        py::call_guard<py::gil_scoped_release>())
 
         // -- 后台轮询 --
         .def("start_state_polling", &HightorqueSerial::start_state_polling,
