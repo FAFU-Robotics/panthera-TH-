@@ -1,0 +1,64 @@
+# =============================================================================
+# Panthera_Workspace .gitignore
+# 说明:
+#   - panthera_web/panthera_motor.cp*-win_amd64.pyd 与 panthera_web/serial_cmake.dll
+#     是项目运行时分发产物 (放在 panthera_web 根目录), 仍然纳入版本管理.
+#   - panthera_web/build/ 下的中间产物全部忽略.
+# =============================================================================
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+*$py.class
+
+# ---- 构建目录 ----
+build/
+*/build/
+
+# ---- MSVC / CMake 中间产物 ----
+*.obj
+*.iobj
+*.ipdb
+*.pdb
+*.idb
+*.ilk
+*.exp
+*.tlog
+*.recipe
+*.lastbuildstate
+*.unsuccessfulbuild
+
+# ---- IDE / 编辑器 ----
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.ncb
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+*.code-workspace
+
+# ---- 日志 / 临时 ----
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# ---- AI / Cursor / Claude ----
+.claude/
+*.claude
+
+# ---- 不再跟踪的运行日志 ----
+panthera_web/last_run.log
