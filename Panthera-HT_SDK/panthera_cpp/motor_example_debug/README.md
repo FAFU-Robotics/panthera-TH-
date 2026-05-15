@@ -75,13 +75,24 @@ cmake --build build --config Release
 
 ### Linux / WSL
 
+**推荐**：用 `linux/` 子目录里的一键脚本，包含装依赖、USB 权限、实时调度等 Ubuntu 专属配套，详见 [`linux/README.md`](linux/README.md)。
+
 ```bash
 cd Panthera-HT_SDK/panthera_cpp/motor_example_debug
+bash linux/install_deps.sh        # apt 装 build-essential / cmake, 加入 dialout 组
+bash linux/setup_udev.sh          # (推荐) 装 udev 规则, 固定 /dev/panthera_debug_board
+bash linux/build.sh               # 编译到 build_linux/bin/
+./build_linux/bin/11_multi_joint_control
+```
+
+裸 cmake 也可以（不带任何 Ubuntu 自动配置）：
+
+```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-可执行文件：`build/bin/11_multi_joint_control`
+可执行文件：`build/bin/11_multi_joint_control` 或 `build_linux/bin/11_multi_joint_control`
 
 ## 使用
 

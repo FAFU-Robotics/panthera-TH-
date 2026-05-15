@@ -27,7 +27,7 @@ Conventions
 Example
 -------
 
->>> from panthera_arm_controller import PantheraArmController
+>>> from wrs_panthera_arm_controller import PantheraArmController
 >>> import numpy as np
 >>>
 >>> # cfg_path is required; gripper is optional (motor id 7 in the
@@ -293,7 +293,7 @@ class PantheraArmController:
     @property
     def gripper_motor_id(self) -> Optional[int]:
         return self._gripper_motor_id
-
+        
     @property
     def driver(self) -> pm.HightorqueSerial:
         """Escape hatch to the underlying ``HightorqueSerial`` instance."""
@@ -587,31 +587,64 @@ class PantheraArmController:
     # ------------------------------------------------------------------
     #  Gripper
     # ------------------------------------------------------------------
+    # Default gripper speed: 0.3 turns/s = 108 deg/s.  Full Panthera-HT
+    # gripper range (~113 deg) finishes in roughly 1 second.
+    _GRIPPER_VEL_DEFAULT = 0.3
+    _GRIPPER_ACC_DEFAULT = 0.5
+    _GRIPPER_TOLERANCE_TURNS = 0.005          # ~ 1.8 deg
+    _GRIPPER_STALL_VEL_TPS = 0.005            # < 1.8 deg/s ⇒ "not moving"
+    _GRIPPER_STALL_PATIENCE_S = 0.3           # treat as done if stalled this long
+
     def gripper_control(
         self,
-        angle: float = 0.0,
+        angle: float,
         *,
         is_radians: bool = True,
-        vel: float = 0.05,
-        acc: float = 0.05,
+        vel: float = _GRIPPER_VEL_DEFAULT,
+        acc: float = _GRIPPER_ACC_DEFAULT,
+        block: bool = True,
+        timeout: float = 8.0,
+        tolerance_deg: float = 1.5,
     ) -> None:
-        """Drive the gripper joint to ``angle``.
+        """Drive the gripper joint to an explicit ``angle``.
 
-        Unlike Piper, the Panthera gripper is just another rotational
-        motor, so ``angle`` is interpreted as a joint angle (radians
-        by default) rather than a linear opening width.
+        Unlike the Piper gripper (linear width in metres), the
+        Panthera gripper is just another rotational motor, so
+        ``angle`` is interpreted as a **joint angle** (radians by
+        default).  No "open / close" semantics are applied here -
+        the value is sent as-is and clamped by the soft limit.
+
+        On the stock Panthera-HT cfg the convention is::
+
+            limits.7 = -114.98 deg (lower)  ─ closer to fully closed
+                        -1.83  deg (upper)  ─ open
+
+        ...so a more *open* gripper is a *less negative* angle.  Use
+        :meth:`open_gripper` / :meth:`close_gripper` if you do not
+        want to think about which direction is which.
 
         Parameters
         ----------
-        angle : float, optional
-            Target joint angle.  Defaults to ``0`` (fully closed).
+        angle : float
+            Target joint angle.  Required.
         is_radians : bool, optional
             Interpret ``angle`` as radians (default) or degrees.
         vel : float, optional
-            Velocity limit in turns/s.  Defaults to ``0.05``
-            (~ 18 deg/s).
+            Velocity limit in turns/s.  Defaults to ``0.3`` turns/s
+            (~ 108 deg/s).
         acc : float, optional
-            Acceleration limit in turns/s^2.  Defaults to ``0.05``.
+            Acceleration limit in turns/s^2.
+        block : bool, optional
+            * ``True`` (default): poll the gripper position until it
+              reaches the target (within ``tolerance_deg``), stalls,
+              or ``timeout`` elapses.
+            * ``False``: just send the command and return immediately.
+        timeout : float, optional
+            Maximum seconds to wait when ``block`` is True.  After
+            ``timeout`` the method returns silently even if the
+            target was not reached (e.g. blocked by an object).
+        tolerance_deg : float, optional
+            "Reached" tolerance in degrees.  Defaults to 1.5 deg.
         """
         if not self._has_gripper:
             raise RuntimeError(
@@ -625,44 +658,134 @@ class PantheraArmController:
             float(acc),
             pm.PosUnit.Turns,
         )
+        if block:
+            self._wait_until_gripper_done(
+                pos_turns,
+                timeout=float(timeout),
+                tolerance_turns=tolerance_deg / 360.0,
+            )
+
+    def _gripper_limit_turns(self) -> Tuple[Optional[float], Optional[float]]:
+        """Helper: return the gripper's (lo, hi) soft limit in turns."""
+        try:
+            lim = self._ht.get_position_limit_turns(self._gripper_motor_id)
+        except Exception:
+            lim = None
+        if lim is None:
+            return (None, None)
+        return (float(lim[0]), float(lim[1]))
 
     def open_gripper(
         self,
         angle: Optional[float] = None,
         *,
         is_radians: bool = True,
-        vel: float = 0.05,
+        vel: float = _GRIPPER_VEL_DEFAULT,
+        acc: float = _GRIPPER_ACC_DEFAULT,
+        block: bool = True,
+        timeout: float = 8.0,
     ) -> None:
         """Open the gripper.
+
+        On Panthera-HT a more *open* gripper corresponds to the
+        **upper** soft limit (a less negative angle).  When ``angle``
+        is ``None`` (default) the gripper is driven to that upper
+        limit, which gives the largest opening allowed by the
+        configuration.
 
         Parameters
         ----------
         angle : float, optional
-            Target opening angle.  If ``None``, the gripper is driven
-            to its upper soft limit (or +0.25 turns ~ 90 deg if no
-            limit is configured).
+            Explicit target angle.  When omitted, the upper soft
+            limit is used (or +0.25 turns ~ 90 deg if no limit is
+            configured).
         is_radians : bool, optional
             Interpret ``angle`` as radians (default) or degrees.
         vel : float, optional
             Velocity limit in turns/s.
+        acc : float, optional
+            Acceleration limit in turns/s^2.
+        block : bool, optional
+            Block until the gripper reaches the target / stalls /
+            ``timeout`` elapses.  Defaults to ``True``.
+        timeout : float, optional
+            Max seconds to wait when ``block`` is True.
         """
         if not self._has_gripper:
             raise RuntimeError(
                 "PantheraArmController was constructed without a gripper"
             )
         if angle is None:
-            lim = self._ht.get_position_limit_turns(self._gripper_motor_id)
-            target_turns = lim[1] if lim is not None else 0.25
+            _, hi_t = self._gripper_limit_turns()
+            target_turns = hi_t if hi_t is not None else 0.25
             self._ht.set_pos_vel_acc(
                 self._gripper_motor_id, target_turns,
-                float(vel), float(vel), pm.PosUnit.Turns,
+                float(vel), float(acc), pm.PosUnit.Turns,
             )
+            if block:
+                self._wait_until_gripper_done(target_turns, timeout=float(timeout))
         else:
-            self.gripper_control(angle, is_radians=is_radians, vel=vel, acc=vel)
+            self.gripper_control(
+                angle, is_radians=is_radians, vel=vel, acc=acc,
+                block=block, timeout=timeout,
+            )
 
-    def close_gripper(self, *, vel: float = 0.05) -> None:
-        """Close the gripper (move to 0 rad)."""
-        self.gripper_control(0.0, is_radians=True, vel=vel, acc=vel)
+    def close_gripper(
+        self,
+        angle: Optional[float] = None,
+        *,
+        is_radians: bool = True,
+        vel: float = _GRIPPER_VEL_DEFAULT,
+        acc: float = _GRIPPER_ACC_DEFAULT,
+        block: bool = True,
+        timeout: float = 8.0,
+    ) -> None:
+        """Close the gripper.
+
+        On Panthera-HT a more *closed* gripper corresponds to the
+        **lower** soft limit (a more negative angle).  When ``angle``
+        is ``None`` (default) the gripper is driven to that lower
+        limit, which gives the tightest grip allowed by the
+        configuration.
+
+        Parameters
+        ----------
+        angle : float, optional
+            Explicit target angle.  When omitted, the lower soft
+            limit is used (or -0.25 turns ~ -90 deg if no limit is
+            configured).
+        is_radians : bool, optional
+            Interpret ``angle`` as radians (default) or degrees.
+        vel : float, optional
+            Velocity limit in turns/s.
+        acc : float, optional
+            Acceleration limit in turns/s^2.
+        block : bool, optional
+            Block until the gripper reaches the target / stalls /
+            ``timeout`` elapses.  Defaults to ``True`` so that a
+            grasp action does not get cut short by a subsequent
+            ``close_connection()``.
+        timeout : float, optional
+            Max seconds to wait when ``block`` is True.
+        """
+        if not self._has_gripper:
+            raise RuntimeError(
+                "PantheraArmController was constructed without a gripper"
+            )
+        if angle is None:
+            lo_t, _ = self._gripper_limit_turns()
+            target_turns = lo_t if lo_t is not None else -0.25
+            self._ht.set_pos_vel_acc(
+                self._gripper_motor_id, target_turns,
+                float(vel), float(acc), pm.PosUnit.Turns,
+            )
+            if block:
+                self._wait_until_gripper_done(target_turns, timeout=float(timeout))
+        else:
+            self.gripper_control(
+                angle, is_radians=is_radians, vel=vel, acc=acc,
+                block=block, timeout=timeout,
+            )
 
     def get_gripper_state(self) -> "pm.MotorState":
         """Return the latest :class:`MotorState` of the gripper motor."""
@@ -779,8 +902,35 @@ class PantheraArmController:
     # ------------------------------------------------------------------
     #  Connection lifecycle
     # ------------------------------------------------------------------
-    def close_connection(self) -> None:
-        """Stop background tasks and close the serial port."""
+    def close_connection(
+        self,
+        *,
+        joint_release: str = "stop",
+        gripper_release: str = "brake",
+    ) -> None:
+        """Stop background tasks and close the serial port.
+
+        Parameters
+        ----------
+        joint_release : {"stop", "brake", "hold"}, optional
+            What to do with the manipulator joints before closing.
+
+            * ``"stop"`` (default): mode 0x00, PWM off, joints free
+              to be moved by hand. Safest if a human will reposition
+              the arm. Heavy joints may sag slightly under gravity.
+            * ``"brake"``: mode 0x0F, short-circuit damping. No
+              current required, but resists motion. Use this if you
+              want the pose to roughly hold without keeping the
+              motors energised.
+            * ``"hold"``: keep mode 0x0A, motors actively hold their
+              last commanded position. Uses current; do not leave
+              like this for long.
+        gripper_release : {"stop", "brake", "hold"}, optional
+            Same options for the gripper.  Defaults to ``"brake"`` so
+            that the gripper does **not** drift open the moment the
+            program disconnects (the previous default of ``"stop"``
+            caused exactly that issue).
+        """
         try:
             if self._ht.is_polling():
                 self._ht.stop_state_polling()
@@ -791,16 +941,37 @@ class PantheraArmController:
                 self._ht.disable_async_rx()
         except Exception:
             pass
+
+        valid = {"stop", "brake", "hold"}
+        if joint_release not in valid:
+            raise ValueError(f"joint_release must be one of {valid}")
+        if gripper_release not in valid:
+            raise ValueError(f"gripper_release must be one of {valid}")
+
+        mode_map = {
+            "stop":  self.MODE_STOP,
+            "brake": self.MODE_BRAKE,
+            "hold":  self.MODE_POSITION,
+        }
         for mid in self._cfg.motor_ids:
+            policy = (gripper_release if (self._has_gripper
+                                          and mid == self._gripper_motor_id)
+                      else joint_release)
             try:
-                self._ht.stop(mid)
+                if policy == "stop":
+                    self._ht.stop(mid)
+                else:
+                    # brake (0x0F) or hold (0x0A) — both are mode changes,
+                    # not the dedicated stop()/brake() RPCs.
+                    self._ht.set_motor_mode(mid, mode_map[policy])
             except Exception:
                 pass
         try:
             self._ht.close()
         except Exception:
             pass
-        print("[PantheraArm] connection closed.")
+        print(f"[PantheraArm] connection closed "
+              f"(joints={joint_release}, gripper={gripper_release}).")
 
     def __enter__(self) -> "PantheraArmController":
         return self
@@ -938,6 +1109,60 @@ class PantheraArmController:
             if s is not None:
                 out[mid] = s
         return out
+
+    def _wait_until_gripper_done(
+        self,
+        target_turns: float,
+        *,
+        timeout: float = 8.0,
+        tolerance_turns: Optional[float] = None,
+    ) -> None:
+        """Block until the gripper reaches ``target_turns``, stalls,
+        or ``timeout`` elapses.
+
+        We treat the move as "done" if any of:
+
+        * |position - target| <= tolerance, OR
+        * |velocity| < stall threshold for ``_GRIPPER_STALL_PATIENCE_S``
+          (covers grasping objects with finite stiffness, where
+          position will plateau short of the target),
+        * timeout exceeded (silent return; caller can re-check).
+        """
+        if not self._has_gripper:
+            return
+        if tolerance_turns is None:
+            tolerance_turns = self._GRIPPER_TOLERANCE_TURNS
+
+        deadline = time.monotonic() + max(0.05, float(timeout))
+        last_pos = None
+        stall_since: Optional[float] = None
+
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                return
+
+            s = self._ht.get_cached_state(self._gripper_motor_id)
+            if s is None:
+                s = self._ht.read_motor_state(self._gripper_motor_id, 0.05)
+            if s is not None:
+                if abs(s.position - target_turns) <= tolerance_turns:
+                    return
+
+                if abs(s.velocity) < self._GRIPPER_STALL_VEL_TPS:
+                    if stall_since is None:
+                        stall_since = now
+                    elif now - stall_since >= self._GRIPPER_STALL_PATIENCE_S:
+                        # The gripper has effectively stopped; either it
+                        # reached the soft limit / a grasped object, or
+                        # something is wrong.  Either way, no point
+                        # waiting longer.
+                        return
+                else:
+                    stall_since = None
+                last_pos = s.position  # noqa: F841 - kept for future debugging
+
+            time.sleep(0.02)
 
     def _build_many_cmds_holding_others(
         self,
@@ -1099,35 +1324,56 @@ if __name__ == "__main__":
         gripper_motor_id=args.gripper_id,
     )
 
+    def _print(*a, **kw):
+        # The 50Hz polling thread can interleave its log output with
+        # ours. Sleep briefly so its line is fully flushed first,
+        # then print our own line with explicit flush.
+        time.sleep(0.02)
+        kw.setdefault("flush", True)
+        print(*a, **kw)
+
     try:
-        print("\n--- Initial state ---")
+        _print("\n--- Initial state ---")
         q = arm.get_joint_values()
-        print(f"  joint angles (deg): {np.degrees(q).round(2).tolist()}")
-        print(f"  is_enabled        : {arm.is_enabled}")
-        print(f"  stats             : {arm.get_status().to_string()}")
+        _print(f"  joint angles (deg): {np.degrees(q).round(2).tolist()}")
+        _print(f"  is_enabled        : {arm.is_enabled}")
+        _print(f"  stats             : {arm.get_status().to_string()}")
 
         if args.no_move:
-            print("\n[--no-move] skipping motion demo.")
+            _print("\n[--no-move] skipping motion demo.")
         else:
-            print("\n--- Going home (joint zero) ---")
+            _print("\n--- Going home (joint zero) ---")
             arm.go_home(speed=args.speed, block=True)
 
-            print("\n--- Tiny sinusoidal demo on the last joint (block=False) ---")
+            _print("\n--- Tiny sinusoidal demo on the last joint (block=False) ---")
             base = arm.get_joint_values()
+            # When has_gripper=True the gripper motor is *not* in
+            # joint_motor_ids, so we drive J6 (the last manipulator
+            # joint).  When there is no gripper, the loop drives the
+            # 7th motor as before.
             for i in range(40):
                 base[-1] = math.radians(10.0) * math.sin(i * math.pi / 20.0)
                 arm.move_j(base, speed=args.speed, block=False)
                 time.sleep(0.05)
 
             if has_gripper:
-                print("\n--- Gripper demo ---")
-                arm.open_gripper()
-                time.sleep(1.0)
+                _print("\n--- Gripper demo (open -> close, using soft limits) ---")
+                arm.open_gripper()        # blocking, default vel 0.3 turns/s
+                gs = arm.get_gripper_state()
+                _print(f"  after open : gripper "
+                       f"{math.degrees(arm._turns_to_rad(gs.position)):+.2f} deg")
+                time.sleep(0.3)
                 arm.close_gripper()
-                time.sleep(1.0)
+                gs = arm.get_gripper_state()
+                _print(f"  after close: gripper "
+                       f"{math.degrees(arm._turns_to_rad(gs.position)):+.2f} deg")
 
-        print("\n--- Final state ---")
+        _print("\n--- Final state ---")
         q = arm.get_joint_values()
-        print(f"  joint angles (deg): {np.degrees(q).round(2).tolist()}")
+        _print(f"  joint angles (deg): {np.degrees(q).round(2).tolist()}")
+        if has_gripper:
+            gs = arm.get_gripper_state()
+            _print(f"  gripper           : "
+                   f"{math.degrees(arm._turns_to_rad(gs.position)):+.2f} deg")
     finally:
         arm.close_connection()
