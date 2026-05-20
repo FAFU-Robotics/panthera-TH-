@@ -56,10 +56,19 @@ namespace fafu_robot {
 //  常量 / 枚举
 // ============================================================================
 
-// 电机模式 (与底层调试板协议一致, 对应 hightorque_serial.set_motor_mode 的 mode 参数)
-inline constexpr uint8_t MODE_POSITION = 0x0A;   // 位置控制 / 保持
-inline constexpr uint8_t MODE_BRAKE    = 0x0F;   // 短路刹车 (耗能小, 抗动)
-inline constexpr uint8_t MODE_STOP     = 0x00;   // PWM 关闭, 可手推
+// ----------------------------------------------------------------------------
+//  电机协议层模式 (mode 字节, 写到电机寄存器 0x00)
+//
+//  调试板协议只暴露 3 个 mode 字节. 所有"位置 / 速度 / 力矩 / 电流 / 电压 /
+//  MIT" 这些应用层控制方式都共用 MODE_ACTIVE (0x0A), 区别只在子帧 cmd 字节,
+//  不需要切 mode. 所以这里只有 3 个常量是设计.
+// ----------------------------------------------------------------------------
+inline constexpr uint8_t MODE_STOP     = 0x00;   // PWM 关闭, 可手推, 不耗电
+inline constexpr uint8_t MODE_ACTIVE   = 0x0A;   // 主动控制 (位/速/力/电压/电流/MIT 全部走这里)
+inline constexpr uint8_t MODE_BRAKE    = 0x0F;   // 三相短路刹车, 抗扭, 不耗电
+
+// 旧名字保留为别名, 避免破坏现有调用方
+inline constexpr uint8_t MODE_POSITION = MODE_ACTIVE;
 
 // close_connection() 时如何对待电机
 enum class ReleaseMode {
@@ -199,6 +208,89 @@ public:
     bool go_home(int speed = 20, bool block = true);
 
     // ----------------------------------------------------------------------
+    //  Servo (online streaming) 控制
+    //
+    //  跟 move_j (offline S-curve, 阻塞) 不同, servoJ 是给"上层在线规划 /
+    //  teleop / VR / 视觉伺服"用的连续 streaming 接口:
+    //
+    //  - 调用一次 servo_start() 启动会话 (设固件 watchdog, 启 async RX,
+    //    把首点初始化成当前位置).
+    //  - 然后上层以固定周期 (推荐 100-200 Hz) 调用 servo_j(target_angles),
+    //    每次发送一帧 set_many_pos_vel_tqe (一帧 ~3ms). 函数非阻塞, 不阻塞
+    //    上层规划循环.
+    //  - 不再 servo 时调 servo_end(finish_mode) 清掉看门狗 + 切到指定退出
+    //    状态 (默认 Brake).
+    //
+    //  安全 (四道防线):
+    //    1. 固件 watchdog (ServoOpts::watchdog_ms): 如果 ≥watchdog_ms 没
+    //       收到新指令, 电机自己 brake. 上位机 crash / Ctrl-C / USB 拔出
+    //       都能救回. **这是最关键的保险, 永远不要关 (watchdog_ms=0).**
+    //    2. 单步限幅 (ServoOpts::max_step_rad): 跟上次 target 比, |Δ| 大
+    //       于这个值就 clamp + 警告. 防上层 bug 阶跃跳变.
+    //    3. 跟踪误差监测 (ServoOpts::max_lag_rad): 实测位置跟 target 偏离
+    //       超过这个值, 返回 false 并打印警告 (机械卡死 / 力矩不够 / 上层
+    //       发太快了).
+    //    4. 软限位: 复用 enable_position_limit() 已配的, 自动 clamp.
+    //
+    //  典型用法:
+    //
+    //      arm.servo_start({.watchdog_ms = 100, .max_vel = 1.0,
+    //                       .max_step_rad = 0.05});
+    //      while (!quit) {
+    //          auto target = compute_next_target();    // 你的规划
+    //          if (!arm.servo_j(target)) {
+    //              // 通信 / 限位 / 跟踪误差报警
+    //              break;
+    //          }
+    //          std::this_thread::sleep_until(next_tick);   // 100Hz
+    //      }
+    //      arm.servo_end(ReleaseMode::Brake);
+    // ----------------------------------------------------------------------
+    struct ServoOpts {
+        // 固件级看门狗时长 (ms). 固件如果 >watchdog_ms 没收到新指令会自动停.
+        // 推荐 80~200ms (上层周期 10ms → watchdog 100ms 给 10 帧裕量).
+        // 0 = 禁用看门狗 (★ 不推荐, 上位机崩溃后电机会保持上一指令冲到限位 ★).
+        int    watchdog_ms      = 100;
+
+        // 每关节最大速度 (rad/s), 写到 set_many_pos_vel_tqe 的 vel 字段.
+        // 电机内部用此速度跟随目标点. 取保守值, 默认 1.0 rad/s (~57 deg/s).
+        double max_vel          = 1.0;
+
+        // 单步最大跳变 (rad). 跟上次 target 比, |Δ| > max_step_rad 会被
+        // clamp 到 ±max_step_rad. 默认 0.05 rad (~2.9 deg), 上层 100Hz 跑
+        // 1 rad/s 的轨迹时单步 0.01 rad, 完全够; 阶跃 bug 会被立刻挡掉.
+        double max_step_rad     = 0.05;
+
+        // 跟踪误差上限 (rad). |measured - target| > max_lag_rad 视为跟不上,
+        // servo_j 返回 false 并打印警告. 默认 0.2 rad (~11.5 deg).
+        // 设为 0 / 负值 = 关闭检测.
+        double max_lag_rad      = 0.2;
+
+        // joint_angles 单位 (true=弧度, false=度). 跟 move_j 一致.
+        bool   is_radians       = true;
+    };
+
+    // 进入 servo 会话. 失败抛 std::runtime_error.
+    // - 把 watchdog 写到每个关节电机 (夹爪不参与 servo, 不写)
+    // - 强制 async_rx (没启过就启) + 确保 polling 在跑
+    // - 抓取当前位置作为 last_target_, 这样首次 servo_j 不会 step clamp
+    void servo_start(const ServoOpts& opts = {});
+
+    // 单次 servo (非阻塞, 立即返回).
+    // 返回:
+    //   true  — 已发送 (可能被 step / soft-limit clamp, 不算失败)
+    //   false — 长度错 / lag 超限 / 通信失败. 上层应该停下来排查.
+    bool servo_j(const std::vector<double>& target_angles);
+
+    // 退出 servo 会话.
+    // - 清掉 watchdog (set_timeout 0)
+    // - 按 finish_mode 处理电机 (默认 Brake — 不掉手不抖)
+    void servo_end(ReleaseMode finish_mode = ReleaseMode::Brake);
+
+    // 当前是否在 servo 会话中
+    bool is_servoing() const { return servo_active_; }
+
+    // ----------------------------------------------------------------------
     //  状态读取 (从 polling 缓存; prefer_cache=false 则现读)
     // ----------------------------------------------------------------------
     // 返回所有关节电机的角度 (弧度)
@@ -290,13 +382,11 @@ public:
     // 所有电机立即切 STOP (PWM off). 一般跟 resume() 配对.
     void emergency_stop();
 
-    // 从急停恢复 — 把所有电机切回 MODE_POSITION.
+    // 从急停恢复 — 把所有电机切回 MODE_ACTIVE.
     void resume();
 
-    // 取调试板原始 `can status` 字符串
-    std::string get_status();
-
-    // 解析后的 CanStatus 结构
+    // 调试板 CAN 总线状态 (CanFault enum + 错误计数). 想拿原始字符串可以走
+    // driver().can_status().
     hightorque::CanStatus get_can_status();
 
     // 把某个电机的当前位置标定为 0. confirm=false 时只打印警告, 不执行.
@@ -357,9 +447,6 @@ private:
     // 软限位读取 (gripper 用). 返回 (lo, hi) 圈 / nullopt.
     std::optional<std::pair<double, double>> gripper_limit_turns_() const;
 
-    // 获取夹爪当前 turns (cache 优先).
-    std::optional<double> gripper_current_turns_();
-
     // ---- 数据 ----
     hightorque::RobotConfig                       cfg_;
     std::string                                   cfg_path_;
@@ -374,6 +461,13 @@ private:
 
     bool                                          owns_polling_ = false;
     bool                                          owns_rx_      = false;
+
+    // ---- servo session ----
+    bool                                          servo_active_     = false;
+    ServoOpts                                     servo_opts_{};
+    std::vector<double>                           servo_last_target_turns_;   // size = num_joints
+    std::chrono::steady_clock::time_point         servo_started_at_{};
+    uint64_t                                      servo_tick_count_ = 0;
 
     // S-curve 调参 (与 Python 同步)
     static constexpr double VEL_AVG_MAX_TPS_ = 0.5;

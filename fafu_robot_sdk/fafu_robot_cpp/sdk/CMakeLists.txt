@@ -34,6 +34,7 @@ if(FAFU_BUILD_SDK_EXAMPLES)
         01_smoke
         02_move_j
         03_gripper
+        04_servo_j
     )
 
     foreach(_ex IN LISTS _FAFU_SDK_EXAMPLES)
