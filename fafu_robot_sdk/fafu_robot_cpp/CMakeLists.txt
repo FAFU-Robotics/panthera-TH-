@@ -25,7 +25,12 @@
 #    -Dpybind11_DIR=<cmake_dir>        ← pybind11 cmake 配置目录
 # =============================================================================
 cmake_minimum_required(VERSION 3.18)
-project(panthera_motor LANGUAGES CXX)
+project(fafu_robot_cpp LANGUAGES CXX)
+
+# 顶层选项
+option(FAFU_BUILD_PYBIND11_MODULE  "Build the pybind11 module panthera_motor"   ON)
+option(FAFU_BUILD_NATIVE_SDK       "Build the native C++ SDK (sdk/)"            ON)
+option(FAFU_BUILD_SDK_EXAMPLES     "Build sdk/examples/*.exe"                   ON)
 
 set(CMAKE_CXX_STANDARD          17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,9 +49,11 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # -----------------------------------------------------------------------------
-#  pybind11
+#  pybind11 (仅当 FAFU_BUILD_PYBIND11_MODULE=ON 才需要)
 # -----------------------------------------------------------------------------
-find_package(pybind11 CONFIG REQUIRED)
+if(FAFU_BUILD_PYBIND11_MODULE)
+    find_package(pybind11 CONFIG REQUIRED)
+endif()
 
 # -----------------------------------------------------------------------------
 #  Vendored: serial_cmake (跨平台串口库, 原 wjwwood/serial 的 fork)
@@ -76,17 +83,26 @@ target_link_libraries(hightorque_serial_debug PUBLIC serial_cmake)
 #  pybind11 模块: panthera_motor
 #  (名字保留 "panthera_motor" 以兼容 FafuRobotController 里的 `import panthera_motor`.)
 # -----------------------------------------------------------------------------
-pybind11_add_module(panthera_motor
-    bindings.cpp
-)
+if(FAFU_BUILD_PYBIND11_MODULE)
+    pybind11_add_module(panthera_motor
+        bindings.cpp
+    )
 
-target_link_libraries(panthera_motor PRIVATE
-    hightorque_serial_debug
-)
+    target_link_libraries(panthera_motor PRIVATE
+        hightorque_serial_debug
+    )
 
-target_include_directories(panthera_motor PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
+    target_include_directories(panthera_motor PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+endif()
+
+# -----------------------------------------------------------------------------
+#  原生 C++ SDK: fafu_robot_sdk  (sdk/)
+# -----------------------------------------------------------------------------
+if(FAFU_BUILD_NATIVE_SDK)
+    add_subdirectory(sdk)
+endif()
 
 # -----------------------------------------------------------------------------
 #  POST_BUILD: 把产物 (.pyd + serial_cmake.dll) 复制到 ../fafu_robot_python/
@@ -95,21 +111,23 @@ if(NOT DEFINED FAFU_ROBOT_PYTHON_DIR)
     set(FAFU_ROBOT_PYTHON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../fafu_robot_python)
 endif()
 
-add_custom_command(TARGET panthera_motor POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${FAFU_ROBOT_PYTHON_DIR}
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        $<TARGET_FILE:panthera_motor>
-        ${FAFU_ROBOT_PYTHON_DIR}/$<TARGET_FILE_NAME:panthera_motor>
-    COMMENT "复制 panthera_motor 模块到 ${FAFU_ROBOT_PYTHON_DIR}/"
-)
-
-if(WIN32)
+if(FAFU_BUILD_PYBIND11_MODULE)
     add_custom_command(TARGET panthera_motor POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${FAFU_ROBOT_PYTHON_DIR}
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:serial_cmake>
-            ${FAFU_ROBOT_PYTHON_DIR}/$<TARGET_FILE_NAME:serial_cmake>
-        COMMENT "复制 serial_cmake.dll 到 ${FAFU_ROBOT_PYTHON_DIR}/"
+            $<TARGET_FILE:panthera_motor>
+            ${FAFU_ROBOT_PYTHON_DIR}/$<TARGET_FILE_NAME:panthera_motor>
+        COMMENT "复制 panthera_motor 模块到 ${FAFU_ROBOT_PYTHON_DIR}/"
     )
+
+    if(WIN32)
+        add_custom_command(TARGET panthera_motor POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:serial_cmake>
+                ${FAFU_ROBOT_PYTHON_DIR}/$<TARGET_FILE_NAME:serial_cmake>
+            COMMENT "复制 serial_cmake.dll 到 ${FAFU_ROBOT_PYTHON_DIR}/"
+        )
+    endif()
 endif()
 
 # -----------------------------------------------------------------------------
@@ -117,10 +135,15 @@ endif()
 # -----------------------------------------------------------------------------
 message(STATUS "")
 message(STATUS "================================================================")
-message(STATUS " fafu_robot_cpp (panthera_motor pybind11) 配置完成")
-message(STATUS "   pybind11_DIR             = ${pybind11_DIR}")
-message(STATUS "   Python                   = ${PYTHON_EXECUTABLE} (${PYTHON_VERSION_STRING})")
-message(STATUS "   Vendored serial_cmake    = ${_SERIAL_CMAKE_DIR}")
-message(STATUS "   FAFU_ROBOT_PYTHON_DIR    = ${FAFU_ROBOT_PYTHON_DIR}")
+message(STATUS " fafu_robot_cpp 配置完成")
+message(STATUS "   FAFU_BUILD_PYBIND11_MODULE = ${FAFU_BUILD_PYBIND11_MODULE}")
+message(STATUS "   FAFU_BUILD_NATIVE_SDK      = ${FAFU_BUILD_NATIVE_SDK}")
+message(STATUS "   FAFU_BUILD_SDK_EXAMPLES    = ${FAFU_BUILD_SDK_EXAMPLES}")
+if(FAFU_BUILD_PYBIND11_MODULE)
+    message(STATUS "   pybind11_DIR               = ${pybind11_DIR}")
+    message(STATUS "   Python                     = ${PYTHON_EXECUTABLE} (${PYTHON_VERSION_STRING})")
+    message(STATUS "   FAFU_ROBOT_PYTHON_DIR      = ${FAFU_ROBOT_PYTHON_DIR}")
+endif()
+message(STATUS "   Vendored serial_cmake      = ${_SERIAL_CMAKE_DIR}")
 message(STATUS "================================================================")
 message(STATUS "")

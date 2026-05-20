@@ -1,8 +1,12 @@
 # fafu_robot_cpp — C++ binding source for `panthera_motor.pyd`
 
-这是 **Fafu robot SDK** 的 **C++ 侧**: 用 pybind11 把调试板 USB 串口协议封装成
-Python 扩展模块 `panthera_motor`, 供 `../fafu_robot_python/` 那一侧的
-`FafuRobotController` 当作底层驱动调用.
+这是 **Fafu robot SDK** 的 **C++ 侧**, 包含两套并列的产物:
+
+1. **`panthera_motor.pyd`** (pybind11 模块) — 给 `../fafu_robot_python/`
+   那一侧的 `FafuRobotController` (Python) 当底层驱动用.
+2. **`fafu_robot_sdk.lib`** (静态库, 在 `sdk/` 子目录) — 原生 C++ 高层 SDK
+   `fafu_robot::FafuRobotController`, 不依赖 Python 也能跑. 详见
+   [`sdk/README.md`](sdk/README.md).
 
 > **★ 完全自包含 ★**
 > 本目录已经把所有需要的 C++ 源码 (协议层 + serial_cmake 三方串口库) 都
@@ -29,35 +33,46 @@ Python 扩展模块 `panthera_motor`, 供 `../fafu_robot_python/` 那一侧的
 ```
 fafu_robot_cpp/
 ├── README.md                                ← 你正在看的文件
-├── bindings.cpp                             ← pybind11 绑定 (主入口)
-├── CMakeLists.txt                           ← 构建配置
-├── build.bat                                ← Windows 一键构建脚本
+├── bindings.cpp                             ← pybind11 绑定 (主入口, 产 panthera_motor.pyd)
+├── CMakeLists.txt                           ← 顶层构建配置
+├── build.bat                                ← Windows 一键构建脚本 (编 .pyd + .lib + 3 个 .exe)
 │
-├── include/                                 ← vendored 头文件 (协议层)
+├── include/                                 ← vendored 头文件 (协议层, 双侧共用)
 │   ├── hightorque_serial.hpp                ← HightorqueSerial 类 + 数据结构
 │   └── robot_config.hpp                     ← robot.cfg 解析
 │
-├── src/                                     ← vendored 实现 (协议层)
+├── src/                                     ← vendored 实现 (协议层, 双侧共用)
 │   └── hightorque_serial.cpp                ← HightorqueSerial 实现
 │
-└── third_part/
-    └── serial_cmake/                        ← vendored 跨平台串口库
-        ├── CMakeLists.txt
-        ├── cmake/
-        ├── include/serial/                  ← serial.h / v8stdint.h / impl/{unix,win}.h
-        └── src/                             ← serial.cc + impl/{unix,win,list_ports/*}.cc
+├── third_part/
+│   └── serial_cmake/                        ← vendored 跨平台串口库 (双侧共用)
+│
+└── sdk/                                     ← ★ 原生 C++ SDK ★
+    ├── README.md                            详细文档 (强烈推荐先看这个)
+    ├── CMakeLists.txt                       static lib + examples 构建
+    ├── include/fafu/
+    │   └── fafu_robot_controller.hpp        唯一公开头文件
+    ├── src/
+    │   └── fafu_robot_controller.cpp        实现
+    └── examples/                            01_smoke / 02_move_j / 03_gripper
 ```
 
-构建过程会生成两份产物, 由 CMake 的 POST_BUILD 自动复制到
-`../fafu_robot_python/`:
+构建产物 (Release):
 
 ```
-../fafu_robot_python/panthera_motor.cpXY-win_amd64.pyd
-../fafu_robot_python/serial_cmake.dll                       (仅 Windows)
+build/bin/Release/panthera_motor.cpXY-win_amd64.pyd     ← 自动 copy 到 ../fafu_robot_python/
+build/bin/Release/serial_cmake.dll                       ← 自动 copy 到 ../fafu_robot_python/
+build/sdk/Release/fafu_robot_sdk.lib                     ← 原生 C++ SDK 静态库
+build/bin/Release/01_smoke.exe                           ← 已带 robot.cfg + serial_cmake.dll
+build/bin/Release/02_move_j.exe                          ← 已带 robot.cfg + serial_cmake.dll
+build/bin/Release/03_gripper.exe                         ← 已带 robot.cfg + serial_cmake.dll
 ```
 
 Python 侧不用配置 PYTHONPATH, 直接
 `from fafu_robot_python import FafuRobotController` 就能用.
+
+原生 C++ 侧, 自己的项目里 `target_link_libraries(my_app PRIVATE fafu_robot_sdk)`
+即可 — 详见 [`sdk/README.md`](sdk/README.md).
 
 ---
 
