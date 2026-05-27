@@ -373,6 +373,36 @@ public:
         int     max_motor_id = 0,
         double  timeout_s    = 0.05);
 
+    // ----- "Partial broadcast" 控制循环热路径专用 (servoJ / teleop) -----
+    //
+    // 对 active_ids 列出的电机发 (pos, vel, tqe) 主动控制, 同时对 hold_ids
+    // 列出的电机用各自的 ★ 缓存当前位置 ★ 作为 target (vel=0). 这样:
+    //   * watchdog 不会因为某些电机被"漏发"而触发刹车
+    //   * 上层 (Python servo_j / teleop loop) 不需要每 tick 重新拼 cmd vector
+    //   * Python binding 可以走 numpy buffer 一次 memcpy, 比 list of
+    //     ManyMotorCmd 对象 marshalling 快 100x (~5us vs ~200us / tick)
+    //
+    // 参数:
+    //   active_ids/active_pos/active_vel  同长度 N. 默认按 PosUnit::Turns 解释 pos,
+    //                                     vel 单位永远是 turns/s.
+    //   tqe_raw                           原始 int16 力矩上限, 应用于 active 电机.
+    //                                     0 = 用电机默认最大力矩 (NAN_INT16 语义).
+    //   hold_ids                          这些电机用 get_cached_state(id) 拿到的
+    //                                     position 作 target, vel=0, tqe 同上.
+    //                                     cache 还没数据的电机会被静默跳过.
+    //   max_motor_id                      帧 slot 数. 0 = 自动按出现的最大 id.
+    //   timeout_s                         回包等待上限. async_rx 模式下传 0 可
+    //                                     立即返回 (不等回包), 返回空 map.
+    std::map<int, MotorState> set_many_pos_vel_tqe_partial(
+        const std::vector<int>&    active_ids,
+        const std::vector<double>& active_pos,
+        const std::vector<double>& active_vel,
+        int16_t                    tqe_raw,
+        const std::vector<int>&    hold_ids,
+        PosUnit pos_unit     = PosUnit::Turns,
+        int     max_motor_id = 0,
+        double  timeout_s    = 0.0);
+
     // motor_model 用于查 TORQUE_COEFF 表换算 Nm; 留空则当作系数 1.0
     std::optional<MotorState> set_torque(int motor_id, double tqe_nm,
                                          const std::string& motor_model = "");

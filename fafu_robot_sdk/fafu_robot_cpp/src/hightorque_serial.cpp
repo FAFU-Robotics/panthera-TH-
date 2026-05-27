@@ -481,8 +481,17 @@ std::string MotorState::to_string() const {
 std::optional<MotorState> parse_motor_state_int16(const std::vector<uint8_t>& can_data) {
     if (can_data.size() < 2) return std::nullopt;
 
+    // -- robustness fix 2026-05 -------------------------------------------
+    // 老版本在遇到 op != 2 的首字节 (即整帧不是 reply 子帧) 时, break 出
+    // 循环再 `return state;` —— 返回的是一个 *零初始化* 的 MotorState
+    // (id=0, mode=0, fault=0, position=0, velocity=0, torque=0). 这会让
+    // 上层 cache 误以为电机突然瞬移到原点, 触发 lag-trip / safety
+    // cascade. 修复: 只有真的解析到至少一个寄存器才返回 state, 否则
+    // 上抛 std::nullopt 让上层把帧当 rx_dropped, cache 保持不动.
+    // ---------------------------------------------------------------------
     MotorState state;
     std::size_t offset = 0;
+    bool any_field_parsed = false;
 
     while (offset < can_data.size()) {
         if (can_data[offset] == PADDING) {
@@ -495,7 +504,12 @@ std::optional<MotorState> parse_motor_state_int16(const std::vector<uint8_t>& ca
         const uint8_t dtype = (cmd >> 2) & 0x03;
         const uint8_t count =  cmd       & 0x03;
 
-        if (op != 2) break;            // 不是回复帧
+        // 不是 reply 子帧 → 帧结构不可信. 已经解析过 1+ 寄存器就保留已有
+        // 数据 (帧后半段被截断的可能性), 否则当作脏帧丢弃.
+        if (op != 2) {
+            if (!any_field_parsed) return std::nullopt;
+            break;
+        }
 
         ++offset;
         if (offset >= can_data.size()) break;
@@ -511,27 +525,27 @@ std::optional<MotorState> parse_motor_state_int16(const std::vector<uint8_t>& ca
                     if (offset + 2 > can_data.size()) break;
                     const int16_t val = read_le_i16(can_data, offset);
                     const int reg = addr + i;
-                    if      (reg == 0x00) state.mode     = val;
-                    else if (reg == 0x01) state.position = int16_to_turns(val);
-                    else if (reg == 0x02) state.velocity = int16_to_rps(val);
-                    else if (reg == 0x03) state.torque   = static_cast<double>(val);
+                    if      (reg == 0x00) { state.mode     = val;                          any_field_parsed = true; }
+                    else if (reg == 0x01) { state.position = int16_to_turns(val);          any_field_parsed = true; }
+                    else if (reg == 0x02) { state.velocity = int16_to_rps(val);            any_field_parsed = true; }
+                    else if (reg == 0x03) { state.torque   = static_cast<double>(val);     any_field_parsed = true; }
                 }
             } else if (dtype == 2) {   // int32
                 for (uint8_t i = 0; i < num; ++i) {
                     if (offset + 4 > can_data.size()) break;
                     const int32_t val = read_le_i32(can_data, offset);
                     const int reg = addr + i;
-                    if      (reg == 0x00) state.mode     = val;
-                    else if (reg == 0x01) state.position = val * 0.00001;
-                    else if (reg == 0x02) state.velocity = val * 0.00001;
-                    else if (reg == 0x03) state.torque   = static_cast<double>(val);
+                    if      (reg == 0x00) { state.mode     = val;                          any_field_parsed = true; }
+                    else if (reg == 0x01) { state.position = val * 0.00001;                any_field_parsed = true; }
+                    else if (reg == 0x02) { state.velocity = val * 0.00001;                any_field_parsed = true; }
+                    else if (reg == 0x03) { state.torque   = static_cast<double>(val);     any_field_parsed = true; }
                 }
             } else if (dtype == 0) {   // int8
                 for (uint8_t i = 0; i < num; ++i) {
                     if (offset + 1 > can_data.size()) break;
                     const int8_t val = read_le_i8(can_data, offset);
                     const int reg = addr + i;
-                    if (reg == 0x0f) state.fault = static_cast<int>(val) & 0xFF;
+                    if (reg == 0x0f) { state.fault = static_cast<int>(val) & 0xFF;         any_field_parsed = true; }
                 }
             }
         } else {                       // 模式一
@@ -552,25 +566,31 @@ std::optional<MotorState> parse_motor_state_int16(const std::vector<uint8_t>& ca
                 const int reg = addr + i;
                 if (reg == 0x00) {
                     state.mode = (dtype == 3) ? static_cast<int>(f_val) : i_val;
+                    any_field_parsed = true;
                 } else if (reg == 0x01) {
                     if      (dtype == 1) state.position = int16_to_turns(static_cast<int16_t>(i_val));
                     else if (dtype == 2) state.position = i_val * 0.00001;
                     else if (dtype == 3) state.position = f_val;
                     else                 state.position = i_val;
+                    any_field_parsed = true;
                 } else if (reg == 0x02) {
                     if      (dtype == 1) state.velocity = int16_to_rps(static_cast<int16_t>(i_val));
                     else if (dtype == 2) state.velocity = i_val * 0.00001;
                     else if (dtype == 3) state.velocity = f_val;
                     else                 state.velocity = i_val;
+                    any_field_parsed = true;
                 } else if (reg == 0x03) {
                     state.torque = (dtype == 3) ? f_val : static_cast<double>(i_val);
+                    any_field_parsed = true;
                 } else if (reg == 0x0f) {
                     state.fault = ((dtype == 3) ? static_cast<int>(f_val) : i_val) & 0xFF;
+                    any_field_parsed = true;
                 }
             }
         }
     }
 
+    if (!any_field_parsed) return std::nullopt;
     return state;
 }
 
@@ -840,6 +860,16 @@ std::optional<MotorState> HightorqueSerial::set_motor_mode(int motor_id, uint8_t
     //
     // 其他 mode (0x00 停止 / 0x0F 刹车) 用现成接口.
     if (mode == 0x0A) {
+        // ★ Brake -> Active reliability fix (2026-05).
+        // 某些固件版本下电机处于 MODE_BRAKE (0x0F) 时, read_motor_state
+        // 会超时 (firmware 不主动回 state 报文), 上层会以为电机"refused
+        // mode 0x0A", 必须断电才能恢复. 先无条件 stop 一下把它踢回
+        // MODE_STOP 是已知可靠路径, 代价仅一帧 (~2ms) + 5ms 沉降.
+        // 对本来就在 Active/Stop 的电机这一步是无副作用的: stop -> active
+        // 是 SDK 已经长期使用的可靠路径.
+        (void)stop(motor_id);
+        sleep_seconds(0.005);
+
         auto cur = read_motor_state(motor_id, 0.2);
         if (!cur) return std::nullopt;
 
@@ -986,6 +1016,98 @@ std::map<int, MotorState> HightorqueSerial::set_many_pos_vel_tqe(
     for (auto& [rid, rdata] : replies) {
         int motor_id = (rid >> 8) & 0x7F;
         if (motor_id == 0) motor_id = rid & 0x7F;     // 老固件兜底
+        if (motor_id < 1 || motor_id > n_slots) continue;
+        if (auto st = parse_motor_state_int16(rdata)) {
+            st->id = motor_id;
+            if (auto it = limit_flags.find(motor_id); it != limit_flags.end()) {
+                st->pos_limit_flag = it->second;
+            }
+            out[motor_id] = *st;
+        }
+    }
+    return out;
+}
+
+// "Partial broadcast" — servoJ / teleop 热路径.
+// 与 set_many_pos_vel_tqe 共用一帧编码格式 (build_many_pos_vel_tqe_int16),
+// 区别只是 cmd 是从 active_ids + hold_ids 两组 vector 合成, 而不是上层
+// 拼好的 ManyMotorCmd 数组. 这样 Python binding 可以走 numpy buffer 而
+// 不是 list of objects, marshalling 开销从 ~200us 降到 ~5us per tick.
+std::map<int, MotorState> HightorqueSerial::set_many_pos_vel_tqe_partial(
+        const std::vector<int>&    active_ids,
+        const std::vector<double>& active_pos,
+        const std::vector<double>& active_vel,
+        int16_t                    tqe_raw,
+        const std::vector<int>&    hold_ids,
+        PosUnit pos_unit, int max_motor_id, double timeout_s) {
+
+    std::map<int, MotorState> out;
+
+    if (active_ids.size() != active_pos.size() ||
+        active_ids.size() != active_vel.size()) {
+        return out;     // 长度不一致, 拒绝发送
+    }
+    if (active_ids.empty() && hold_ids.empty()) return out;
+
+    // 1) slot 数 (帧长度).
+    int n_slots = max_motor_id;
+    if (n_slots <= 0) {
+        for (int id : active_ids) n_slots = std::max(n_slots, id);
+        for (int id : hold_ids)   n_slots = std::max(n_slots, id);
+    }
+    if (n_slots <= 0) return out;
+
+    std::vector<int16_t> pos_arr(n_slots, NAN_INT16);
+    std::vector<int16_t> vel_arr(n_slots, NAN_INT16);
+    std::vector<int16_t> tqe_arr(n_slots, NAN_INT16);
+
+    // 2) Active 电机 — 应用 soft limit (与 set_many_pos_vel_tqe 行为一致).
+    std::map<int, int> limit_flags;
+    const int16_t tqe_slot = (tqe_raw == 0) ? NAN_INT16 : saturate_to_i16(tqe_raw);
+    int expected = 0;
+    for (size_t k = 0; k < active_ids.size(); ++k) {
+        const int mid = active_ids[k];
+        if (mid < 1 || mid > n_slots) continue;
+
+        const auto [pos_t, flag] = apply_position_limit_(mid, to_turns(active_pos[k], pos_unit));
+        limit_flags[mid] = flag;
+
+        const std::size_t idx = static_cast<std::size_t>(mid - 1);
+        pos_arr[idx] = turns_to_int16(pos_t);
+        vel_arr[idx] = rps_to_int16(active_vel[k]);
+        tqe_arr[idx] = tqe_slot;
+        ++expected;
+    }
+
+    // 3) Hold 电机 — 用 cache 里的当前位置当 target, vel=0.
+    //    cache 还没有数据的电机 (轮询线程没起 / 该电机不在 polling 列表) 静默跳过.
+    for (int mid : hold_ids) {
+        if (mid < 1 || mid > n_slots) continue;
+        const std::size_t idx = static_cast<std::size_t>(mid - 1);
+        if (pos_arr[idx] != NAN_INT16) continue;   // 已经被 active 占了, 不覆盖
+
+        auto cur = get_cached_state(mid);
+        if (!cur) continue;     // 没有缓存就跳过, 不发该电机, 它进入 watchdog
+
+        // 注意: hold 时不走 apply_position_limit_, 因为缓存的就是真实位置,
+        // 走限位再 clamp 反而可能在边界电机上来回小幅震荡.
+        pos_arr[idx] = turns_to_int16(cur->position);
+        vel_arr[idx] = 0;     // 显式 0 (不是 NAN_INT16): "目标 = hold pos, 速度 = 0"
+        tqe_arr[idx] = tqe_slot;
+        ++expected;
+    }
+
+    // 4) 发. timeout_s <= 0 直接异步发出去不等回包 (servo loop 用法).
+    const auto data = build_many_pos_vel_tqe_int16(pos_arr, vel_arr, tqe_arr);
+    if (timeout_s <= 0.0 || expected <= 0) {
+        (void)send_can_and_recv_(0x8090, data, 0.0, 0);
+        return out;     // 空 map
+    }
+
+    auto replies = send_can_and_recv_(0x8090, data, timeout_s, expected);
+    for (auto& [rid, rdata] : replies) {
+        int motor_id = (rid >> 8) & 0x7F;
+        if (motor_id == 0) motor_id = rid & 0x7F;
         if (motor_id < 1 || motor_id > n_slots) continue;
         if (auto st = parse_motor_state_int16(rdata)) {
             st->id = motor_id;

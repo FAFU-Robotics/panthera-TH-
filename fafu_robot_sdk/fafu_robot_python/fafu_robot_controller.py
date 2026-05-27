@@ -165,6 +165,96 @@ class GraspResult:
     duration_s: float
 
 
+@dataclass
+class ServoOpts:
+    """Tunables for an online ``servo_j`` streaming session.
+
+    See the four safety lines documented on
+    :meth:`FafuRobotController.servo_start`.
+
+    Attributes
+    ----------
+    watchdog_ms : int, optional
+        Firmware-side watchdog in milliseconds.  If the motor receives
+        no new command for this long it automatically brakes.  Default
+        ``100``.  Set to ``0`` to disable (★ not recommended ★).
+    max_vel : float, optional
+        Per-joint velocity cap in **rad/s** written into every frame
+        (``set_many_pos_vel_tqe`` ``vel`` field).  Default ``1.0``
+        (~57 deg/s).  When ``feedforward_vel=True`` this acts as an
+        upper safety bound on the computed feedforward velocity.
+    max_step_rad : float, optional
+        Per-step jump limit in **rad**.  ``|target - last_target|``
+        larger than this is clamped to ``±max_step_rad`` and a warning
+        is logged.  Default ``0.05`` (~2.9 deg).
+    max_lag_rad : float, optional
+        Tracking-error guard in **rad**.  If any motor's measured
+        position deviates from its last target by more than this,
+        the tick is flagged as a "lag-trip" and the running counter
+        :attr:`FafuRobotController.servo_lag_count` is incremented
+        (and ``servo_end`` prints the total).  The frame is **still
+        sent** so the firmware watchdog cannot brake the rest of the
+        arm; pass ``lag_abort_consecutive`` if you need automatic
+        protective stop on persistent lag.  Default ``0.2``
+        (~11.5 deg).  Set to ``0`` / negative to disable the
+        counter entirely.
+    is_radians : bool, optional
+        Interpret arguments to :meth:`servo_j` in radians (default) or
+        degrees.  Matches :meth:`move_j`.
+    rate_hz : float, optional
+        Nominal upper-layer call rate **only used to compute dt for
+        feedforward and lookahead**.  Default ``100.0``.  The actual
+        call rate is still set by however fast the caller invokes
+        :meth:`servo_j`; this number does not throttle anything.
+    feedforward_vel : bool, optional
+        Default ``True``.  When enabled, the per-frame ``vel`` field
+        written to each motor is the **true required velocity**
+        ``(target[k] - target[k-1]) * rate_hz`` (clamped to
+        ``±max_vel``), exactly like UR servoj's internal velocity
+        feedforward.  When ``False`` every frame uses the constant
+        ``max_vel`` as ``vel``, which makes the motor "always sprint"
+        toward each target and is the dominant source of high-frequency
+        whine in joystick / teleop scenarios.
+    lookahead_time : float, optional
+        Default ``0.0`` (no smoothing).  When ``> 0``, an exponential
+        moving average (first-order low-pass) with time constant
+        ``lookahead_time`` is applied to every target before it is
+        sent.  Recommended ``0.03 - 0.10`` s for noisy upper layers
+        (joystick teleop, VR, vision servoing); leave at ``0`` when the
+        upper layer already produces a smooth trajectory (planned
+        path).  This is the same knob UR servoj exposes as
+        ``lookahead_time``.
+    lag_abort_consecutive : int, optional
+        Default ``0`` (off).  When ``> 0``, the servo session is
+        automatically terminated with :meth:`servo_end` (``"brake"``)
+        after this many *consecutive* lag-tripped ticks.  This is the
+        old "fail-stop" behaviour, just bounded so a single bad tick
+        does not kill the loop.  Recommended in production: ``5`` -
+        ``10`` (50 - 100 ms of persistent lag).  Leave at ``0`` for
+        diagnostic scripts.
+    """
+
+    watchdog_ms: int = 100
+    max_vel: float = 1.0
+    max_step_rad: float = 0.05
+    max_lag_rad: float = 0.2
+    is_radians: bool = True
+    # ---- noise / lag tuning (UR-servoj style) ----
+    rate_hz: float = 100.0
+    feedforward_vel: bool = True
+    lookahead_time: float = 0.0
+    # ---- lag-trip policy ----
+    # Old behaviour was "lag > max_lag_rad ⇒ servo_j returns False ⇒ frame
+    # NOT sent". That turned a single lagging joint into a cascade: the
+    # firmware watchdog on the *good* joints tripped after watchdog_ms of
+    # no frames and braked them too. The new default is "keep sending +
+    # accumulate lag_count"; the lag count is reported by servo_end and
+    # can be polled live via :attr:`FafuRobotController.servo_lag_count`.
+    # Set ``lag_abort_consecutive > 0`` to opt back into auto-abort (handy
+    # for production safety, but not for diagnostic scripts).
+    lag_abort_consecutive: int = 0
+
+
 # ============================================================================
 #  Controller
 # ============================================================================
@@ -312,6 +402,40 @@ class FafuRobotController:
             except Exception as e:
                 print(f"[FafuRobot] warning: start_state_polling failed: {e}")
 
+        # Servo (online streaming) session state. None when not servoing.
+        self._servo_active: bool = False
+        self._servo_opts: Optional[ServoOpts] = None
+        self._servo_last_target_turns: List[float] = []
+        # filtered_target_turns mirrors last_target when lookahead_time == 0;
+        # when smoothing is enabled it lags the raw target by ~lookahead_time.
+        self._servo_filtered_target_turns: List[float] = []
+        # Pre-allocated numpy buffers for set_many_pos_vel_tqe_partial.
+        # active_ids / hold_ids are set once in servo_start and never
+        # re-allocated; active_pos / active_vel are overwritten in place
+        # every tick to avoid per-call numpy allocation.
+        self._servo_active_ids_np: Optional[np.ndarray] = None
+        self._servo_hold_ids_np: Optional[np.ndarray] = None
+        self._servo_active_pos_np: Optional[np.ndarray] = None
+        self._servo_active_vel_np: Optional[np.ndarray] = None
+        self._servo_max_motor_id: int = 0
+        self._servo_max_torque: int = 0
+        self._servo_started_at: float = 0.0
+        self._servo_tick_count: int = 0
+        # warning counters for batched logging at servo_end
+        self._servo_clamp_count: int = 0
+        self._servo_lag_count: int = 0
+        # Track *consecutive* lag-tripped ticks to support
+        # lag_abort_consecutive. Reset to 0 every time a tick comes
+        # in clean (lag <= max_lag_rad).
+        self._servo_lag_streak: int = 0
+        # One-shot warning so the user sees a live notice on the first
+        # lag-trip without flooding the console at 100Hz.
+        self._servo_lag_warned: bool = False
+        # Sticky flag — once auto-abort fires we refuse further servo_j
+        # frames so callers can detect the condition. Cleared by
+        # servo_start.
+        self._servo_aborted_reason: Optional[str] = None
+
         print(
             f"[FafuRobot] connected on {self._port} @ {self._baudrate} "
             f"({len(self._joint_motor_ids)} joints"
@@ -375,21 +499,133 @@ class FafuRobotController:
     # ------------------------------------------------------------------
     #  Power management
     # ------------------------------------------------------------------
-    def enable(self) -> None:
+    def enable(self, *, allow_motor_reset: bool = True) -> None:
         """Switch every motor to position control (mode ``0x0A``).
+
+        Resolution path (cheapest to most aggressive):
+
+        0. **Fast path.** Read every motor's live state; if all are
+           already in MODE_POSITION (left over from a previous
+           ``servo_end("hold")`` or ``close_connection(release="hold")``)
+           return without sending any mode-change frame.  This both
+           saves ~30 ms and avoids a known false-failure mode of
+           ``set_motor_mode(0x0A)`` whose internal "switch + read-back"
+           sequence sometimes reports ``None`` on a freshly-reopened
+           port even when the mode change actually succeeded.
+        1. **Normal path.** Call :meth:`_switch_mode_all` with up to
+           3 retries; it now does a fresh ``read_motor_state`` to
+           verify failures, filtering out the false-failure case
+           above.
+        2. **Soft-reboot path.** If the normal path still fails, print
+           a diagnostic for every motor (mode / fault / position read
+           live), then issue a firmware-level ``motor_reset`` to every
+           failed motor (fire-and-forget reset of the on-motor
+           controller — does **not** clear zero / config), wait 1 s
+           for them to come back up, and try the normal path one more
+           time.
+
+        Most cases of "refused mode 0x0A" after a previous
+        ``servo_end`` / ``close_connection`` are resolved at step 2
+        without a hardware power-cycle.
+
+        Parameters
+        ----------
+        allow_motor_reset : bool, optional
+            Default ``True``.  Set to ``False`` to keep the legacy
+            behaviour (raise immediately if step 1 fails).  Useful
+            when something else owns the bus and you do not want a
+            stealth ``motor_reset``.
 
         Raises
         ------
         RuntimeError
-            If the driver fails to confirm the mode after a few retries.
+            Either step 1 (when ``allow_motor_reset=False``) or both
+            stages exhausted.  In the latter case the printed
+            diagnostic above tells you whether the motors are
+            unreachable (no state read), faulted (non-zero ``fault``
+            register), or mechanically jammed (mode = 0x0A but the
+            commanded position cannot be tracked).
         """
-        if not self._switch_mode_all(self.MODE_POSITION, label="position", max_retry=3):
+        # Stage-0: fast path. read once, skip the whole switch if every
+        # motor is already in MODE_POSITION. This handles the common
+        # case of "previous program left motors holding" cleanly and
+        # cheaply, and dodges the sync-read false-failure issue.
+        already_active = True
+        for mid in self._cfg.motor_ids:
+            s = self._ht.read_motor_state(mid, 0.2)
+            if s is None or int(s.mode) != self.MODE_POSITION:
+                already_active = False
+                break
+        if already_active:
+            print("[FafuRobot] all motors already in position control hold; "
+                  "enable() is a no-op.")
+            return
+
+        if self._switch_mode_all(self.MODE_POSITION, label="position", max_retry=3):
+            time.sleep(0.05)
+            print("[FafuRobot] all motors enabled (position control hold).")
+            return
+
+        # Stage-1 failed. Print a diagnostic so the next message is
+        # actionable instead of a generic "refused".
+        self._print_motor_diagnostic(prefix="enable: stage-1 failed; ")
+
+        if not allow_motor_reset:
             raise RuntimeError(
-                "enable failed: at least one motor refused mode 0x0A; "
-                "power-cycle the motors and try again"
+                "enable failed: at least one motor refused mode 0x0A "
+                "(motor_reset recovery disabled by allow_motor_reset=False)"
             )
+
+        # Stage-2: motor_reset is a firmware-level soft reboot of the
+        # on-motor controller. It is the equivalent of pulling power on
+        # *only that motor* for a few hundred ms, without losing zero
+        # calibration / soft limits / etc. Use as last resort before
+        # asking the user to power-cycle.
+        print("[FafuRobot] enable: attempting motor_reset on every motor (soft reboot) ...")
+        for mid in self._cfg.motor_ids:
+            try:
+                self._ht.motor_reset(mid)
+            except Exception as e:
+                print(f"  motor {mid}: motor_reset failed: {e}")
+        # Firmware needs time to come back. Empirically ~0.6 s is
+        # enough on the boards we have; 1.0 s gives margin.
+        time.sleep(1.0)
+
+        if not self._switch_mode_all(self.MODE_POSITION, label="position (post-reset)", max_retry=3):
+            self._print_motor_diagnostic(prefix="enable: stage-2 (post-reset) failed; ")
+            raise RuntimeError(
+                "enable failed even after motor_reset; check the "
+                "diagnostic above. Likely causes: (a) motor controller "
+                "in latched FAULT state -> hard power-cycle; "
+                "(b) USB-CAN bus disconnected / wrong COM port; "
+                "(c) mechanical jam holding the joint outside soft limits."
+            )
+
         time.sleep(0.05)
-        print("[FafuRobot] all motors enabled (position control hold).")
+        print("[FafuRobot] all motors enabled (recovered via motor_reset).")
+
+    def _print_motor_diagnostic(self, *, prefix: str = "") -> None:
+        """Read every motor's live state and print a compact summary.
+
+        Used by :meth:`enable` to turn an opaque "refused mode 0x0A"
+        into something a user can act on.  Reads are synchronous with
+        a generous timeout (300 ms) so the failure mode "motor does
+        not respond" is also obvious.
+        """
+        print(f"[FafuRobot] {prefix}motor states:")
+        for mid in self._cfg.motor_ids:
+            try:
+                s = self._ht.read_motor_state(mid, 0.3)
+            except Exception as e:
+                print(f"  motor {mid}: READ EXCEPTION {e}")
+                continue
+            if s is None:
+                print(f"  motor {mid}: NO RESPONSE (read timeout) — bus or motor power off?")
+                continue
+            fault_val = getattr(s, "fault", 0)
+            fault_tag = "fault=OK" if not fault_val else f"fault=0x{int(fault_val):02X} ★"
+            print(f"  motor {mid}: mode=0x{int(s.mode):02X}  {fault_tag}  "
+                  f"pos={s.position:+.3f}t  vel={s.velocity:+.3f}t/s")
 
     def disable(self) -> None:
         """Switch every motor to free-spin mode (mode ``0x00``)."""
@@ -540,6 +776,475 @@ class FafuRobotController:
                 block=False,
             )
             time.sleep(max(0.005, control_frequency))
+
+    # ------------------------------------------------------------------
+    #  Servo (online streaming) control
+    # ------------------------------------------------------------------
+    #
+    #  Unlike :meth:`move_j` (offline S-curve, blocking), ``servo_j`` is
+    #  designed for upper-layer code that streams a fresh joint target
+    #  every ~10 ms (e.g. teleop, VR, visual servoing, in-the-loop IK).
+    #
+    #  Lifecycle::
+    #
+    #      arm.servo_start(ServoOpts(...))     # once: arm watchdog, async RX
+    #      while not quit:
+    #          arm.servo_j(target_angles)      # ~100 Hz, non-blocking
+    #          time.sleep_until(next_tick)
+    #      arm.servo_end("brake")              # clear watchdog + brake
+    #
+    #  Four safety lines (cannot be skipped — they all live inside
+    #  ``servo_j`` and ``servo_start``):
+    #
+    #    1) Firmware-side watchdog ( :func:`HightorqueSerial.set_timeout` )
+    #       — if the motor sees no new command for ``watchdog_ms`` it
+    #       brakes itself. Survives host crash, Ctrl+C, USB unplug.
+    #    2) Per-step jump clamp (``max_step_rad``) — protects against
+    #       upper-layer planner step bugs.
+    #    3) Tracking-error monitor (``max_lag_rad``) — if measured
+    #       position trails ``last_target`` by more than this, ``servo_j``
+    #       returns ``False`` (stuck joint, motor too weak, planner too
+    #       fast, etc.).
+    #    4) Soft limits — reuses :meth:`enable_position_limit`; the
+    #       underlying ``set_many_pos_vel_tqe`` clamps automatically.
+    # ------------------------------------------------------------------
+    def servo_start(self, opts: Optional[ServoOpts] = None) -> None:
+        """Enter an online-streaming joint-servo session.
+
+        Idempotent on the second call (warns and returns).  After this
+        every joint motor has a firmware watchdog armed (1) and the
+        wrapper has cached the current joint configuration as the
+        initial ``last_target`` (so the first :meth:`servo_j` cannot
+        trip the step-clamp warning).  The gripper is **not** touched
+        and is not subject to the servo watchdog.
+
+        Parameters
+        ----------
+        opts : ServoOpts, optional
+            Tunables.  Defaults to :class:`ServoOpts` (watchdog 100 ms,
+            max_vel 1.0 rad/s, max_step 0.05 rad, max_lag 0.2 rad).
+
+        Raises
+        ------
+        RuntimeError
+            If the driver fails to enable async RX (servo cannot run on
+            the blocking sync-RX path) or any joint motor fails to
+            report a starting position.
+        """
+        if self._servo_active:
+            print("[FafuRobot] servo_start: already servoing; call servo_end first")
+            return
+
+        opts = ServoOpts(**vars(opts)) if opts is not None else ServoOpts()
+        if opts.watchdog_ms < 0:
+            opts.watchdog_ms = 0
+        if opts.watchdog_ms == 0:
+            print("[FafuRobot] servo_start: WARNING watchdog disabled; "
+                  "host crash will not stop motors. Use only for offline tests.")
+        elif opts.watchdog_ms < 30:
+            print(f"[FafuRobot] servo_start: WARNING watchdog_ms={opts.watchdog_ms} "
+                  "< 30 may trip spuriously at 100Hz; recommend >= 50 ms.")
+        if opts.max_vel <= 0.0:
+            opts.max_vel = 1.0
+        if opts.max_step_rad <= 0.0:
+            opts.max_step_rad = 0.05
+        if opts.rate_hz <= 0.0:
+            opts.rate_hz = 100.0
+        if opts.lookahead_time < 0.0:
+            opts.lookahead_time = 0.0
+
+        if not self.is_enabled:
+            print("[FafuRobot] servo_start: motors not enabled, calling enable() ...")
+            self.enable()
+
+        # Servo cannot tolerate the 5-15 ms sync RX wait inside
+        # send_can_and_recv_, so force async RX on if it is not already.
+        if not self._ht.is_async_rx():
+            try:
+                self._ht.enable_async_rx()
+                time.sleep(0.05)
+            except Exception as e:
+                raise RuntimeError(f"servo_start: enable_async_rx failed: {e}") from e
+
+        # Capture current pos as last_target so the first servo_j is a
+        # zero-step move and never trips the step-clamp warning.
+        last_target: List[float] = []
+        for mid in self._joint_motor_ids:
+            s = self._ht.get_cached_state(mid)
+            if s is None:
+                s = self._ht.read_motor_state(mid, 0.1)
+            if s is None:
+                raise RuntimeError(
+                    f"servo_start: cannot read motor {mid} starting position")
+            last_target.append(s.position)
+
+        # Pre-build the numpy arrays consumed by
+        # ``set_many_pos_vel_tqe_partial`` so the per-tick allocation
+        # cost is zero (we only memcpy target_pos / target_vel into
+        # the pre-allocated buffers below; active_ids / hold_ids never
+        # change for a session).
+        active_ids_np = np.asarray(self._joint_motor_ids, dtype=np.int32)
+        # Non-joint motors are normally "held" at cached pos each tick.
+        # The gripper must be excluded: otherwise every servo_j overwrites
+        # M7 back to the position captured at servo_start, canceling
+        # open_gripper/close_gripper (non-blocking) commands.
+        hold_motor_ids = [
+            mid for mid in self._cfg.motor_ids if mid not in self._joint_motor_ids
+        ]
+        if self._has_gripper and self._gripper_motor_id is not None:
+            hold_motor_ids = [
+                mid for mid in hold_motor_ids if mid != self._gripper_motor_id
+            ]
+        hold_ids_np = np.asarray(hold_motor_ids, dtype=np.int32)
+        # Pre-allocated output buffers reused every tick.
+        N = len(self._joint_motor_ids)
+        active_pos_np = np.zeros(N, dtype=np.float64)
+        active_vel_np = np.zeros(N, dtype=np.float64)
+
+        # Arm the firmware watchdog on every JOINT motor (gripper excluded
+        # — gripper is not part of the servo loop, watching it would brake
+        # the jaws while the loop is still in start-up).
+        if opts.watchdog_ms > 0:
+            for mid in self._joint_motor_ids:
+                try:
+                    self._ht.set_timeout(mid, int(opts.watchdog_ms))
+                except Exception as e:
+                    print(f"[FafuRobot] servo_start: set_timeout({mid}) failed: {e}")
+
+        self._servo_opts = opts
+        self._servo_last_target_turns = list(last_target)
+        self._servo_filtered_target_turns = list(last_target)
+        self._servo_active_ids_np = active_ids_np
+        self._servo_hold_ids_np = hold_ids_np
+        self._servo_active_pos_np = active_pos_np
+        self._servo_active_vel_np = active_vel_np
+        self._servo_max_motor_id = int(max(self._cfg.motor_ids))
+        self._servo_max_torque = int(self._cfg.max_torque_raw)
+        self._servo_active = True
+        self._servo_tick_count = 0
+        self._servo_clamp_count = 0
+        self._servo_lag_count = 0
+        self._servo_lag_streak = 0
+        self._servo_lag_warned = False
+        self._servo_aborted_reason = None
+        self._servo_started_at = time.monotonic()
+
+        ff_tag = "on" if opts.feedforward_vel else "off"
+        la_tag = (f"{opts.lookahead_time * 1000:.0f}ms"
+                  if opts.lookahead_time > 0 else "off")
+        print(
+            f"[FafuRobot] servo_start: watchdog={opts.watchdog_ms}ms, "
+            f"max_vel={opts.max_vel}rad/s, max_step={opts.max_step_rad}rad, "
+            f"max_lag={opts.max_lag_rad}rad, "
+            f"feedforward={ff_tag}, lookahead={la_tag}, rate={opts.rate_hz:.0f}Hz"
+        )
+
+    def servo_j(self, target_angles: Iterable[float]) -> bool:
+        """Stream one joint-space target (non-blocking).
+
+        Call repeatedly at a fixed cadence (recommended 100-200 Hz).
+        Caller is responsible for the sleep between calls; we do not
+        block to enforce a rate.
+
+        Parameters
+        ----------
+        target_angles : iterable of float
+            ``num_joints`` joint angles in the unit declared by
+            :attr:`ServoOpts.is_radians` (radians by default).
+
+        Returns
+        -------
+        bool
+            * ``True``  — frame was sent.  ``last_target`` advanced.
+              (Step- or limit-clamping does **not** count as failure;
+              it just bumps :attr:`servo_clamp_count`.  Lag-trip does
+              not count as failure either: the frame is still sent
+              and :attr:`servo_lag_count` is bumped.)
+            * ``False`` — payload was rejected and **no frame was
+              sent**.  Reasons: wrong length, NaN/Inf, send exception,
+              :meth:`servo_start` was never called, or an earlier
+              ``lag_abort_consecutive`` event already terminated the
+              session.  ``last_target`` stays untouched so the next
+              ``servo_j`` will still see the same step delta.
+        """
+        if self._servo_aborted_reason is not None:
+            # Session was auto-terminated earlier; refuse silently.
+            # (The abort site already printed a banner.) Caller can
+            # check :attr:`servo_aborted_reason` to know why.
+            return False
+        if not self._servo_active or self._servo_opts is None:
+            print("[FafuRobot] servo_j: not in a servo session; call servo_start first")
+            return False
+
+        opts = self._servo_opts
+        arr = np.asarray(list(target_angles), dtype=float)
+        if arr.size != self.num_joints:
+            print(f"[FafuRobot] servo_j: expected {self.num_joints} angles, "
+                  f"got {arr.size}")
+            return False
+        if not np.all(np.isfinite(arr)):
+            print("[FafuRobot] servo_j: target contains NaN/Inf, refused")
+            return False
+
+        N = self.num_joints
+        dt = 1.0 / opts.rate_hz
+        max_vel_tps = opts.max_vel / _TWO_PI    # rad/s -> turns/s
+
+        # (a) Convert user-units -> turns (protocol native)
+        if opts.is_radians:
+            target_turns = [float(v) / _TWO_PI for v in arr]
+        else:
+            target_turns = [float(v) / 360.0 for v in arr]
+
+        # (b) Defense 2 — per-step clamp on the *raw* upper-layer target,
+        # measured against last successfully-sent filtered target. Without
+        # this an upper-layer bug could push the EMA filter far in one
+        # step (lookahead does NOT bound a single step, only smoothes it).
+        max_step_turns = abs(opts.max_step_rad) / _TWO_PI
+        was_clamped = False
+        for i in range(N):
+            delta = target_turns[i] - self._servo_last_target_turns[i]
+            if abs(delta) > max_step_turns:
+                target_turns[i] = (self._servo_last_target_turns[i]
+                                   + math.copysign(max_step_turns, delta))
+                was_clamped = True
+        if was_clamped:
+            self._servo_clamp_count += 1
+            # No per-tick print — would dominate jitter on 100Hz loops.
+            # The aggregated count is reported in servo_end.
+
+        # (c) Lookahead smoothing — exponential moving average with time
+        # constant ``lookahead_time``. Matches UR servoj's lookahead.
+        # alpha = dt / (lookahead + dt); alpha=1 when lookahead=0 (no smoothing).
+        if opts.lookahead_time > 0.0:
+            alpha = dt / (opts.lookahead_time + dt)
+            target_to_send = [
+                self._servo_filtered_target_turns[i]
+                + alpha * (target_turns[i] - self._servo_filtered_target_turns[i])
+                for i in range(N)
+            ]
+        else:
+            target_to_send = target_turns
+
+        # (d) Per-joint velocity, written directly into the pre-allocated
+        # buffer (no per-tick allocation):
+        #   - feedforward_vel=True (default, UR-style):
+        #         vel[i] = (target_to_send[i] - last_sent[i]) / dt, clamped to ±max_vel
+        #     Eliminates the dominant "motor sprints to every micro-step"
+        #     noise source. Tiny target changes get tiny vel commands.
+        #   - feedforward_vel=False (legacy):
+        #         vel[i] = max_vel_tps for every joint
+        active_pos_buf = self._servo_active_pos_np
+        active_vel_buf = self._servo_active_vel_np
+        if opts.feedforward_vel:
+            for i in range(N):
+                active_pos_buf[i] = target_to_send[i]
+                v = (target_to_send[i] - self._servo_filtered_target_turns[i]) / dt
+                if v > max_vel_tps:    v = max_vel_tps
+                elif v < -max_vel_tps: v = -max_vel_tps
+                active_vel_buf[i] = v
+        else:
+            for i in range(N):
+                active_pos_buf[i] = target_to_send[i]
+            active_vel_buf.fill(max_vel_tps)
+
+        # (e) Defense 3 — tracking-error monitor.
+        #
+        # ★ 2026-05 policy change ★
+        # Old behaviour was "lag > max_lag_rad ⇒ return False ⇒ frame NOT
+        # sent". On hardware that turned a single lagging joint into a
+        # cascade: the firmware watchdog on the *other* joints fired
+        # after watchdog_ms of silence and braked them too. Confirmed
+        # with --no-safety-nets (lag check off): J4 still drooped but
+        # J2/J3 actually completed their motion, so the lag check was
+        # making things worse, not better.
+        #
+        # New behaviour: ALWAYS send the frame; just count lag events
+        # for diagnostics. ``lag_abort_consecutive > 0`` opts back into
+        # protective stop with a sensible debounce.
+        lag_tripped_this_tick = False
+        if opts.max_lag_rad > 0.0:
+            max_lag_turns = opts.max_lag_rad / _TWO_PI
+            for i, mid in enumerate(self._joint_motor_ids):
+                s = self._ht.get_cached_state(mid)
+                if s is None:
+                    continue
+                lag = abs(s.position - target_to_send[i])
+                if lag > max_lag_turns:
+                    lag_tripped_this_tick = True
+                    break   # one bad joint is enough for the counter
+        if lag_tripped_this_tick:
+            self._servo_lag_count += 1
+            self._servo_lag_streak += 1
+            if not self._servo_lag_warned:
+                self._servo_lag_warned = True
+                print(f"[FafuRobot] servo_j: first lag-trip "
+                      f"(|lag| > {opts.max_lag_rad:.3f}rad); "
+                      f"frame is still being sent. "
+                      f"Counter at servo_end will show the total.")
+        else:
+            self._servo_lag_streak = 0
+
+        # (f) Defense 4 — soft limits handled inside set_many_pos_vel_tqe_partial.
+
+        # (g) One C++ call: active joints get (target, ff_vel); optional
+        # hold motors (never the gripper) get hold-at-cached-pos. Hot path is
+        # entirely C++ now: marshalling is 4x numpy memcpy (no Python
+        # ManyMotorCmd object construction), ~5us per tick.
+        try:
+            self._ht.set_many_pos_vel_tqe_partial(
+                self._servo_active_ids_np,
+                active_pos_buf,
+                active_vel_buf,
+                self._servo_max_torque,
+                self._servo_hold_ids_np,
+                pm.PosUnit.Turns,
+                self._servo_max_motor_id,
+                0.0,                    # async_rx is on, don't wait for replies
+            )
+        except Exception as e:
+            print(f"[FafuRobot] servo_j: send failed: {e}")
+            return False
+
+        # Advance state only after a successful send so the next tick's
+        # clamp / feedforward see a consistent "last sent" reference.
+        self._servo_last_target_turns = list(target_turns)
+        self._servo_filtered_target_turns = list(target_to_send)
+        self._servo_tick_count += 1
+
+        # Optional protective-stop: if lag persisted for N ticks in a
+        # row, brake and refuse further frames.  Default opts.value 0
+        # means never auto-abort (preferred for diagnostic scripts).
+        if (opts.lag_abort_consecutive > 0
+                and self._servo_lag_streak >= opts.lag_abort_consecutive):
+            reason = (f"lag_abort_consecutive={opts.lag_abort_consecutive} "
+                      f"exceeded (streak={self._servo_lag_streak})")
+            print(f"[FafuRobot] servo_j: PROTECTIVE STOP — {reason}. "
+                  f"Calling servo_end('brake').")
+            try:
+                self.servo_end(finish_mode="brake")
+            except Exception as e:
+                print(f"[FafuRobot] servo_j: auto servo_end failed: {e}")
+            self._servo_aborted_reason = reason
+            return False
+
+        return True
+
+    def servo_end(self, finish_mode: str = "hold") -> None:
+        """End the servo session and place every joint motor in
+        ``finish_mode``.
+
+        Parameters
+        ----------
+        finish_mode : {"hold", "brake", "stop"}, optional
+            * ``"hold"`` (default): keep the motor in MODE_POSITION
+              (``0x0A``) holding its last commanded frame.  Identical
+              behaviour to the state every motor is in after a
+              successful :meth:`move_j`, so you can immediately chain
+              another ``move_j`` / ``servo_start`` without calling
+              :meth:`enable` again.  Motors stay energised.
+            * ``"brake"``: switch to short-circuit braking
+              (``0x0F``).  No torque output, no current draw, but the
+              joint resists motion (it may still drift slowly under
+              load).  Use when you want to release the loop but keep
+              the arm roughly in place without burning power.
+            * ``"stop"``: PWM off (``0x00``).  Joints free to be moved
+              by hand.  Use only when a human will reposition the arm
+              right after, otherwise the arm will sag.
+
+        Always clears the firmware watchdog first so that the mode
+        change is not interrupted by the watchdog firing in the
+        middle.  The gripper is left alone (we never touched it).
+        """
+        if not self._servo_active:
+            print("[FafuRobot] servo_end: not in a servo session, ignored")
+            return
+
+        valid = {"stop", "brake", "hold"}
+        if finish_mode not in valid:
+            raise ValueError(
+                f"finish_mode must be one of {sorted(valid)}, got {finish_mode!r}")
+
+        opts = self._servo_opts
+        # 1) clear watchdog FIRST so the mode switch is not pre-empted
+        if opts is not None and opts.watchdog_ms > 0:
+            for mid in self._joint_motor_ids:
+                try:
+                    self._ht.set_timeout(mid, 0)
+                except Exception:
+                    pass
+
+        # 2) place motors in finish_mode
+        for mid in self._joint_motor_ids:
+            try:
+                if finish_mode == "stop":
+                    self._ht.stop(mid)
+                elif finish_mode == "brake":
+                    self._ht.set_motor_mode(mid, self.MODE_BRAKE)
+                # "hold": leave in MODE_POSITION with last frame intact
+            except Exception:
+                pass
+
+        elapsed = max(1e-3, time.monotonic() - self._servo_started_at)
+        rate = self._servo_tick_count / elapsed
+        warn_tag = ""
+        if self._servo_clamp_count or self._servo_lag_count:
+            warn_tag = (f"   [warn: step-clamp={self._servo_clamp_count}, "
+                        f"lag-trip={self._servo_lag_count}]")
+        if self._servo_aborted_reason is not None:
+            warn_tag += f"   [auto-aborted: {self._servo_aborted_reason}]"
+        print(f"[FafuRobot] servo_end ({finish_mode}): "
+              f"{self._servo_tick_count} ticks in {elapsed:.2f}s "
+              f"(~{rate:.1f} Hz){warn_tag}")
+
+        self._servo_active = False
+        # NOTE: tick_count / clamp_count / lag_count / aborted_reason
+        # are intentionally NOT zeroed here so user code can read them
+        # via :attr:`servo_lag_count` etc. *after* the loop ends.
+        # They are reset at the start of the next servo_start.
+        self._servo_lag_streak = 0
+        self._servo_last_target_turns = []
+        self._servo_filtered_target_turns = []
+        self._servo_active_ids_np = None
+        self._servo_hold_ids_np = None
+        self._servo_active_pos_np = None
+        self._servo_active_vel_np = None
+        self._servo_max_motor_id = 0
+        self._servo_max_torque = 0
+
+    @property
+    def is_servoing(self) -> bool:
+        """``True`` while a :meth:`servo_start` / :meth:`servo_end`
+        window is open."""
+        return self._servo_active
+
+    @property
+    def servo_lag_count(self) -> int:
+        """Number of lag-tripped ticks observed in the current (or
+        most recently ended) servo session.
+
+        A "lag-trip" is a tick where some joint's measured position
+        differs from the last sent target by more than
+        :attr:`ServoOpts.max_lag_rad`.  The frame is **still** sent on
+        a lag-trip (see :meth:`servo_j` docstring); this counter is
+        purely informational unless ``lag_abort_consecutive`` is in
+        use.
+        """
+        return int(self._servo_lag_count)
+
+    @property
+    def servo_clamp_count(self) -> int:
+        """Number of step-clamped ticks in the current / last session
+        (caller asked for a jump > ``max_step_rad`` and we limited it)."""
+        return int(self._servo_clamp_count)
+
+    @property
+    def servo_aborted_reason(self) -> Optional[str]:
+        """Non-``None`` iff the current session was auto-terminated by
+        ``lag_abort_consecutive``.  Cleared by the next :meth:`servo_start`.
+        While set, :meth:`servo_j` refuses every frame and returns ``False``.
+        """
+        return self._servo_aborted_reason
 
     # ------------------------------------------------------------------
     #  Cartesian motion (placeholders)
@@ -1222,6 +1927,16 @@ class FafuRobotController:
             program disconnects (the previous default of ``"stop"``
             caused exactly that issue).
         """
+        # If a servo session is still open, end it gracefully BEFORE we
+        # stop polling / disable async RX. servo_end clears the firmware
+        # watchdog (which would otherwise fire as soon as we stop
+        # sending frames) and parks the joints in ``joint_release`` mode.
+        if self._servo_active:
+            try:
+                self.servo_end(finish_mode=joint_release)
+            except Exception as e:
+                print(f"[FafuRobot] close_connection: servo_end fallback failed: {e}")
+
         try:
             if self._ht.is_polling():
                 self._ht.stop_state_polling()
@@ -1340,17 +2055,40 @@ class FafuRobotController:
         label: str,
         max_retry: int = 3,
     ) -> bool:
-        need_verify = mode in (self.MODE_STOP, self.MODE_BRAKE)
+        """Drive every motor to ``mode``, verifying the actual state.
+
+        Returns True as soon as every motor's *measured* state is at
+        ``mode``.  This intentionally trusts the post-switch read
+        rather than ``set_motor_mode``'s return value, because that
+        return value can legitimately be ``None`` on a busy /
+        freshly-reopened port even when the mode change succeeded
+        (the binding's internal "switch -> sleep -> read confirm"
+        sequence is timing-sensitive).  We back-stop by issuing a
+        fresh read on every motor that the binding flagged as
+        failing, and only treat it as a real failure if the read
+        confirms a wrong mode.
+        """
         for attempt in range(1, max_retry + 1):
             failed: List[int] = []
             for mid in self._cfg.motor_ids:
                 s = self._ht.set_motor_mode(mid, mode)
-                if need_verify and s is None:
-                    time.sleep(0.02)
-                    s = self._ht.read_motor_state(mid, 0.15)
-                got = s.mode if s is not None else -1
-                if s is None or got != mode:
+                if s is None or int(s.mode) != mode:
                     failed.append(mid)
+
+            # ★ Post-failure verify: do a fresh read on every "failed"
+            # motor to filter out binding false negatives. If the read
+            # confirms the target mode is already there, the motor is
+            # actually fine — common case after a sync-read timeout
+            # inside set_motor_mode(0x0A).
+            if failed:
+                time.sleep(0.03)
+                really_failed: List[int] = []
+                for mid in failed:
+                    s = self._ht.read_motor_state(mid, 0.3)
+                    if s is None or int(s.mode) != mode:
+                        really_failed.append(mid)
+                failed = really_failed
+
             if not failed:
                 return True
             if attempt < max_retry:

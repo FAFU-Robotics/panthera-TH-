@@ -15,6 +15,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>          // std::vector / std::map / std::optional / std::pair
 #include <pybind11/functional.h>   // std::function
+#include <pybind11/numpy.h>        // py::array_t (servoJ partial broadcast, zero-copy)
 
 #include "hightorque_serial.hpp"
 #include "robot_config.hpp"
@@ -27,6 +28,8 @@
 #endif
 
 #include <string>
+#include <cstring>     // std::memcpy (numpy buffer -> std::vector fast path)
+#include <algorithm>   // std::clamp
 
 namespace py = pybind11;
 using namespace hightorque;
@@ -301,6 +304,68 @@ PYBIND11_MODULE(panthera_motor, m) {
              py::arg("cmds"), py::arg("pos_unit") = PosUnit::Turns,
              py::arg("max_motor_id") = 0, py::arg("timeout_s") = 0.05,
              py::call_guard<py::gil_scoped_release>())
+
+        // -------- servoJ / teleop 热路径专用 (numpy zero-copy 风格) --------
+        //
+        // Python 端用法:
+        //   ht.set_many_pos_vel_tqe_partial(
+        //       active_ids_np,        # int32 ndarray (N,)
+        //       active_pos_np,        # float64 ndarray (N,)
+        //       active_vel_np,        # float64 ndarray (N,)
+        //       tqe_raw,              # int (int16 range), 0 = 默认最大力矩
+        //       hold_ids_np,          # int32 ndarray (M,), 用 cached pos hold
+        //       pos_unit=PosUnit.Turns,
+        //       max_motor_id=7,
+        //       timeout_s=0.0)        # 0 = 异步发, 不等回包
+        //
+        // 数组通过 buffer protocol 直接拷成 std::vector (一次 memcpy);
+        // 比 list of ManyMotorCmd 对象 marshalling 快 ~40x.
+        .def("set_many_pos_vel_tqe_partial",
+             [](HightorqueSerial& self,
+                py::array_t<int,    py::array::c_style | py::array::forcecast> active_ids_arr,
+                py::array_t<double, py::array::c_style | py::array::forcecast> active_pos_arr,
+                py::array_t<double, py::array::c_style | py::array::forcecast> active_vel_arr,
+                int                                                            tqe_raw,
+                py::array_t<int,    py::array::c_style | py::array::forcecast> hold_ids_arr,
+                PosUnit pos_unit, int max_motor_id, double timeout_s) {
+                 if (active_ids_arr.ndim() != 1 || active_pos_arr.ndim() != 1 ||
+                     active_vel_arr.ndim() != 1 || hold_ids_arr.ndim()   != 1) {
+                     throw std::runtime_error(
+                         "set_many_pos_vel_tqe_partial: 所有数组必须是 1-D");
+                 }
+                 const size_t n = static_cast<size_t>(active_ids_arr.shape(0));
+                 const size_t m = static_cast<size_t>(hold_ids_arr.shape(0));
+                 if (static_cast<size_t>(active_pos_arr.shape(0)) != n ||
+                     static_cast<size_t>(active_vel_arr.shape(0)) != n) {
+                     throw std::runtime_error(
+                         "set_many_pos_vel_tqe_partial: active_ids/pos/vel 长度必须一致");
+                 }
+                 // memcpy 风格构造 vector (forcecast 已经保证 contiguous + dtype).
+                 // 用 assign 而不是 (iter, iter) 构造, 避开 size_t/iterator overload
+                 // resolution 的歧义 (MSVC 在 ssize_t 上选错 ctor).
+                 std::vector<int>    active_ids(n);
+                 std::vector<double> active_pos(n);
+                 std::vector<double> active_vel(n);
+                 std::vector<int>    hold_ids(m);
+                 if (n) {
+                     std::memcpy(active_ids.data(), active_ids_arr.data(), n * sizeof(int));
+                     std::memcpy(active_pos.data(), active_pos_arr.data(), n * sizeof(double));
+                     std::memcpy(active_vel.data(), active_vel_arr.data(), n * sizeof(double));
+                 }
+                 if (m) {
+                     std::memcpy(hold_ids.data(), hold_ids_arr.data(), m * sizeof(int));
+                 }
+                 const int16_t tqe_i16 = static_cast<int16_t>(
+                     std::clamp(tqe_raw, -32768, 32767));
+                 py::gil_scoped_release release;
+                 return self.set_many_pos_vel_tqe_partial(
+                     active_ids, active_pos, active_vel, tqe_i16, hold_ids,
+                     pos_unit, max_motor_id, timeout_s);
+             },
+             py::arg("active_ids"), py::arg("active_pos"), py::arg("active_vel"),
+             py::arg("tqe_raw"), py::arg("hold_ids"),
+             py::arg("pos_unit") = PosUnit::Turns,
+             py::arg("max_motor_id") = 0, py::arg("timeout_s") = 0.0)
 
         .def("set_torque",  &HightorqueSerial::set_torque,
              py::arg("motor_id"), py::arg("tqe_nm"), py::arg("motor_model") = "",

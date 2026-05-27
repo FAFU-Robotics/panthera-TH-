@@ -65,6 +65,9 @@ ehthumbs.db
 # ---- 不再跟踪的运行日志 ----
 panthera_web/last_run.log
 
+# ---- 备份压缩包 (源码已在仓库里, 不需要再存 zip) ----
+fafu_robot_sdk/fafu_robot_python.zip
+
 # ---- 反规则: SDK 运行时分发产物保留 (绕开上面 *.py[cod] 把 .pyd 误命中) ----
 !fafu_robot_sdk/fafu_robot_python/panthera_motor.cp*-win_amd64.pyd
 !panthera_web/panthera_motor.cp*-win_amd64.pyd
