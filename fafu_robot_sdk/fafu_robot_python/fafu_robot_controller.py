@@ -103,6 +103,21 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     rm = None  # type: ignore
 
+# Optional: pinocchio rigid-body dynamics, only needed for the
+# gravity / Coriolis / mass-matrix terms behind :meth:`setup_dynamics`
+# and :meth:`start_gravity_compensation`.  It is notoriously hard to
+# install on Windows (conda-forge / Linux are the smooth paths), so the
+# whole dynamics feature degrades gracefully: when ``pinocchio`` is
+# missing every dynamics method raises a clear, actionable error and the
+# rest of the controller (move_j / servo_j / gripper) keeps working.
+try:
+    import pinocchio as pin  # type: ignore
+
+    _PIN_EXIST = True
+except Exception:  # pragma: no cover - optional dependency
+    pin = None  # type: ignore
+    _PIN_EXIST = False
+
 
 # ============================================================================
 #  Constants
@@ -120,6 +135,30 @@ _SETTLE_MS       = 300    # extra hold time after the trajectory ends
 
 # 1 turn = 2*pi rad
 _TWO_PI = 2.0 * math.pi
+
+# Per-motor torque coefficient (Nm per raw-int16 LSB), mirrors the C++
+# TORQUE_COEFF table in hightorque_serial.cpp.  The firmware torque command
+# is a raw int16; the driver converts a desired Nm to raw via
+# ``raw = round(tau_nm / coeff)``.  An unknown / empty model maps to coeff
+# 1.0 (raw == Nm, i.e. essentially unscaled -- see setup_dynamics warning).
+TORQUE_COEFF: Dict[str, float] = {
+    # ---- Fafu arm actual motors (measured, authoritative) ----
+    "M5036_02": 0.67,     # J1, J4
+    "M6036_02": 0.677,    # J2, J3
+    "M4438_30": 0.5256,   # J5, J6, J7  (vendor motor_tqe_adj value)
+    # ---- legacy / other Hightorque models ----
+    "M3536_32": 0.458105,
+    "M4438_32": 0.485565,
+    "M4538_19": 0.493835,
+    "M5043_20": 0.966,
+    "M5046_20": 0.533654,
+    "M5047_09": 0.547474,
+    "M5047_36": 0.803,
+    "M6056_36": 0.677,
+    "M7256_35": 0.676524,
+    "M60SG_35": 0.7942,
+    "M60BM_35": 0.7942,
+}
 
 
 # ============================================================================
@@ -253,6 +292,51 @@ class ServoOpts:
     # Set ``lag_abort_consecutive > 0`` to opt back into auto-abort (handy
     # for production safety, but not for diagnostic scripts).
     lag_abort_consecutive: int = 0
+
+
+@dataclass
+class FrictionParams:
+    """Coulomb + viscous joint-friction model for gravity-comp / float mode.
+
+    Mirrors ``2_gravity_friction_compensation_control.py``::
+
+        tau_friction = fc * sign(v) + fv * v
+
+    with a low-speed dead-band: when ``|v| < vel_threshold`` only the
+    viscous term ``fv * v`` is used, so the Coulomb ``sign(v)`` term does
+    not chatter around zero velocity.
+
+    Attributes
+    ----------
+    fc : np.ndarray
+        Per-joint Coulomb friction (Nm) — constant magnitude, opposes the
+        direction of motion.  Identify by driving each joint at a very low
+        constant speed and reading the minimum steady torque needed.
+    fv : np.ndarray
+        Per-joint viscous friction (Nm*s/rad) — proportional to speed.
+        Identify from the slope of the torque-vs-speed curve.  Usually an
+        order of magnitude smaller than ``fc``.
+    vel_threshold : float
+        Speed (rad/s) below which the Coulomb term is suppressed.
+        ``0.01 - 0.05`` is reasonable; default ``0.02``.
+    """
+
+    fc: np.ndarray
+    fv: np.ndarray
+    vel_threshold: float = 0.02
+
+    @staticmethod
+    def reference_6dof() -> "FrictionParams":
+        """Starting values copied from the Panthera-HT reference script.
+
+        ★ These are a *starting point only* — friction is arm- and
+        wear-specific and MUST be re-identified on your hardware. ★
+        """
+        return FrictionParams(
+            fc=np.array([0.20, 0.15, 0.15, 0.15, 0.04, 0.04]),
+            fv=np.array([0.06, 0.06, 0.06, 0.03, 0.02, 0.02]),
+            vel_threshold=0.02,
+        )
 
 
 # ============================================================================
@@ -435,6 +519,29 @@ class FafuRobotController:
         # frames so callers can detect the condition. Cleared by
         # servo_start.
         self._servo_aborted_reason: Optional[str] = None
+
+        # ---- Dynamics (gravity / friction compensation) state ----
+        # All None until setup_dynamics() succeeds. Kept on the instance
+        # so the per-tick compensation loop does not re-load the URDF.
+        self._pin_model = None
+        self._pin_data = None
+        # End-effector frame used by FK/IK (move_p / move_l). Resolved in
+        # setup_dynamics from the URDF ("tool_link" for the follower arm).
+        self._eef_frame_id: Optional[int] = None
+        self._eef_frame_name: Optional[str] = None
+        self._dyn_gravity_vec: np.ndarray = np.array([0.0, 0.0, -9.81])
+        # Per-joint motor model strings used to convert Nm -> raw int16
+        # inside set_pos_vel_tqe_kp_kd. None => "" (coeff 1.0, see
+        # setup_dynamics docstring for why that is unsafe-but-quiet).
+        self._dyn_motor_models: Optional[List[str]] = None
+        # Per-joint torque clip (Nm). Defaults applied in setup_dynamics.
+        self._dyn_tau_limit: Optional[np.ndarray] = None
+        # Per-joint empirical torque gain applied right before sending. Used
+        # to calibrate gravity-comp on real hardware when the Nm->raw coeff
+        # is uncertain: bump it up until the arm just floats. Defaults to 1.0.
+        self._dyn_torque_scale: np.ndarray = np.ones(self.num_joints)
+        self._friction_params: Optional[FrictionParams] = None
+        self._gravity_comp_active: bool = False
 
         print(
             f"[FafuRobot] connected on {self._port} @ {self._baudrate} "
@@ -1247,57 +1354,1272 @@ class FafuRobotController:
         return self._servo_aborted_reason
 
     # ------------------------------------------------------------------
+    #  Dynamics: gravity + friction compensation ("float" / teach mode)
+    # ------------------------------------------------------------------
+    #
+    #  Ported from Panthera-HT's
+    #  ``2_gravity_friction_compensation_control.py``.  The control law is::
+    #
+    #      tau = clip( G(q) + [ fc*sign(v) + fv*v ],  ±tau_limit )
+    #
+    #  and is streamed to every joint motor in MIT mode with
+    #  pos=vel=kp=kd=0 so only the feed-forward torque acts (pure
+    #  open-loop torque == "weightless / float" behaviour you can push
+    #  around by hand).  Coriolis / inertia terms are available too but
+    #  are *not* part of the default compensation (they need q-dot-dot
+    #  which we do not estimate online).
+    #
+    #  Prerequisites (all checked at call time with actionable errors):
+    #    1) ``pinocchio`` installed (gravity / Coriolis / mass need it).
+    #    2) :meth:`setup_dynamics` called once with a URDF that has
+    #       <inertial> tags (the stock Panthera-HT follower URDF does).
+    #    3) Per-joint ``motor_models`` configured so Nm -> raw int16 is
+    #       physically correct (otherwise the arm under-drives and sags —
+    #       which is *safe* but not useful).
+    # ------------------------------------------------------------------
+    def setup_dynamics(
+        self,
+        urdf_path: Optional[str] = None,
+        *,
+        gravity_vec: Iterable[float] = (0.0, 0.0, -9.81),
+        motor_models: Optional[List[str]] = None,
+        tau_limit: Optional[Iterable[float]] = None,
+        torque_scale: Optional[Iterable[float]] = None,
+        friction: Optional[FrictionParams] = None,
+        eef_frame: Optional[str] = None,
+    ) -> None:
+        """Load the rigid-body model used for gravity / dynamics terms.
+
+        Call once before :meth:`get_gravity`,
+        :meth:`compute_compensation_torque` or
+        :meth:`start_gravity_compensation`.
+
+        Parameters
+        ----------
+        urdf_path : str, optional
+            Path to a URDF with ``<inertial>`` data for every link.  When
+            ``None`` the controller searches, in order:
+
+            1. ``<package_dir>/fafu_robot_description/*.urdf``
+               (drop a copy next to the Python package for a fully
+               self-contained deployment),
+            2. the stock Panthera-HT follower URDF under
+               ``Panthera-HT_SDK/panthera_python/Panthera-HT_description``.
+
+            The URDF joint order is assumed to match
+            :attr:`joint_motor_ids` (true for the 6-DoF Panthera/Fafu
+            arm).  ``model.nq`` must equal :attr:`num_joints`.
+        gravity_vec : iterable of 3 float, optional
+            Gravity direction/magnitude in the URDF base frame.  Default
+            ``(0, 0, -9.81)`` (base ``z`` points up).  Flip / rotate this
+            if the arm is wall- or ceiling-mounted.
+        motor_models : list of str, optional
+            One motor-model key **per joint** (in :attr:`joint_motor_ids`
+            order) used by ``set_pos_vel_tqe_kp_kd`` to convert the
+            commanded torque from Nm to the raw int16 the firmware wants.
+            Valid keys are the ones in the driver's ``TORQUE_COEFF`` table
+            (e.g. ``"M7256_35"``, ``"M60BM_35"``, ``"M4438_32"``,
+            ``"M3536_32"`` ...).  When ``None`` every joint uses ``""``
+            (coefficient ``1.0``): the loop still runs but the torque is
+            *not* physically scaled, so the arm will merely sag — safe,
+            but you must fill these in for real compensation.
+        tau_limit : iterable of float, optional
+            Per-joint torque clip (Nm).  Default
+            ``[15, 30, 30, 15, 5, 5]`` (the reference script's values,
+            conservative vs the motors' ``[21, 36, 36, 21, 10, 10]`` Nm
+            ceiling).  Length must equal :attr:`num_joints`.
+        torque_scale : float or iterable of float, optional
+            Empirical gain multiplied into the torque right before it is
+            sent (``tau_sent = tau * torque_scale``).  Use this to
+            calibrate on real hardware when the Nm->raw coefficient is
+            uncertain: start at ``1.0``, run with ``dry_run`` to read the
+            raw int16 that would be sent, then raise it until the arm just
+            floats.  Scalar applies to every joint; a list sets each joint.
+            Default ``1.0`` (no extra gain).
+        friction : FrictionParams, optional
+            Default friction model used when
+            :meth:`get_friction_compensation` is called without explicit
+            params.  Defaults to :meth:`FrictionParams.reference_6dof`.
+        eef_frame : str, optional
+            Name of the URDF frame treated as the end effector for
+            :meth:`forward_kinematics` / :meth:`inverse_kinematics` /
+            :meth:`move_p` / :meth:`move_l`.  Defaults to ``"tool_link"``
+            (the stock Panthera-HT follower tool frame); if that frame
+            is absent the controller falls back to the last joint's child
+            frame.
+
+        Raises
+        ------
+        RuntimeError
+            ``pinocchio`` not installed, URDF not found, or the model's
+            DoF count does not match :attr:`num_joints`.
+        """
+        if not _PIN_EXIST:
+            raise RuntimeError(
+                "gravity/dynamics need the 'pinocchio' package, which is "
+                "not installed.\n"
+                "  - conda:  conda install -c conda-forge pinocchio\n"
+                "  - linux:  pip install pin\n"
+                "  (Windows pip wheels are unreliable; conda-forge or WSL "
+                "is the smooth path.)\n"
+                "Friction-only compensation does NOT need pinocchio."
+            )
+
+        resolved = self._resolve_urdf_path(urdf_path)
+        if resolved is None:
+            raise RuntimeError(
+                "setup_dynamics: could not find a URDF. Pass urdf_path "
+                "explicitly, or drop one under "
+                "'<package>/fafu_robot_description/'."
+            )
+
+        try:
+            model = pin.buildModelFromUrdf(resolved)
+        except Exception as e:
+            raise RuntimeError(f"setup_dynamics: failed to load URDF "
+                               f"{resolved!r}: {e}") from e
+
+        if model.nq != self.num_joints:
+            raise RuntimeError(
+                f"setup_dynamics: URDF DoF ({model.nq}) != num_joints "
+                f"({self.num_joints}). The URDF must describe exactly the "
+                f"{self.num_joints} manipulator joints (gripper excluded), "
+                f"as a simple revolute chain."
+            )
+
+        self._pin_model = model
+        self._pin_data = model.createData()
+        self._resolve_eef_frame(model, eef_frame)
+        self._dyn_gravity_vec = np.asarray(list(gravity_vec), dtype=float)
+        if self._dyn_gravity_vec.shape != (3,):
+            raise ValueError("gravity_vec must have exactly 3 elements")
+
+        if motor_models is not None:
+            if len(motor_models) != self.num_joints:
+                raise ValueError(
+                    f"motor_models must have {self.num_joints} entries "
+                    f"(one per joint), got {len(motor_models)}")
+            self._dyn_motor_models = [str(m) for m in motor_models]
+        else:
+            self._dyn_motor_models = None
+            print("[FafuRobot] setup_dynamics: WARNING no motor_models given; "
+                  "torque will NOT be physically scaled (coeff=1.0). The arm "
+                  "will under-drive / sag. Pass motor_models for real "
+                  "compensation.")
+
+        if tau_limit is not None:
+            tl = np.asarray(list(tau_limit), dtype=float)
+            if tl.shape != (self.num_joints,):
+                raise ValueError(
+                    f"tau_limit must have {self.num_joints} elements")
+            self._dyn_tau_limit = np.abs(tl)
+        else:
+            ref = np.array([15.0, 30.0, 30.0, 15.0, 5.0, 5.0])
+            if self.num_joints == 6:
+                self._dyn_tau_limit = ref
+            else:
+                # Unknown geometry: pick a conservative blanket cap.
+                self._dyn_tau_limit = np.full(self.num_joints, 5.0)
+
+        self.set_torque_scale(torque_scale if torque_scale is not None else 1.0)
+
+        self._friction_params = friction or FrictionParams.reference_6dof()
+
+        print(f"[FafuRobot] dynamics ready: URDF={os.path.basename(resolved)}, "
+              f"dof={model.nq}, eef_frame={self._eef_frame_name!r}, "
+              f"gravity={self._dyn_gravity_vec.tolist()}, "
+              f"tau_limit={self._dyn_tau_limit.tolist()}, "
+              f"torque_scale={self._dyn_torque_scale.tolist()}")
+
+    def _resolve_eef_frame(self, model, eef_frame: Optional[str]) -> None:
+        """Pick the end-effector frame used by FK/IK.
+
+        Preference order: explicit ``eef_frame`` arg → ``"tool_link"`` →
+        the child frame of the last actuated joint.  Stored on the
+        instance as ``_eef_frame_id`` / ``_eef_frame_name``.
+        """
+        candidates: List[str] = []
+        if eef_frame:
+            candidates.append(eef_frame)
+        candidates.append("tool_link")
+        # Last joint name in the chain (joint1..jointN for this arm).
+        try:
+            last_joint = model.names[model.njoints - 1]
+            candidates.append(last_joint)
+        except Exception:
+            pass
+
+        for name in candidates:
+            if model.existFrame(name):
+                self._eef_frame_name = name
+                self._eef_frame_id = model.getFrameId(name)
+                if eef_frame and name != eef_frame:
+                    print(f"[FafuRobot] setup_dynamics: requested eef_frame "
+                          f"{eef_frame!r} not found; using {name!r}.")
+                return
+
+        # Last resort: the very last frame in the model.
+        self._eef_frame_id = model.nframes - 1
+        self._eef_frame_name = model.frames[self._eef_frame_id].name
+        print(f"[FafuRobot] setup_dynamics: no tool frame found; using last "
+              f"frame {self._eef_frame_name!r} as end effector.")
+
+    def set_torque_scale(self, scale: "float | Iterable[float]") -> None:
+        """Set the empirical per-joint torque gain (see ``torque_scale`` in
+        :meth:`setup_dynamics`).  Accepts a scalar or a per-joint list.
+
+        Can be called live (e.g. between calibration runs) without
+        reloading the dynamics model.
+        """
+        arr = np.asarray(scale, dtype=float)
+        if arr.ndim == 0:
+            arr = np.full(self.num_joints, float(arr))
+        if arr.shape != (self.num_joints,):
+            raise ValueError(
+                f"torque_scale must be a scalar or {self.num_joints} values")
+        self._dyn_torque_scale = arr
+
+    def tau_to_raw(self, tau: Iterable[float]) -> np.ndarray:
+        """Convert a per-joint torque (Nm) to the firmware raw int16 that
+        :meth:`apply_compensation_torque` would actually send.
+
+        ``raw = round(tau / (coeff * 0.01))`` per joint, where ``coeff``
+        comes from the joint's motor model (1.0 if no model configured).
+        The ``*0.01`` matches the firmware torque LSB (vendor motor.cpp
+        ``tqe_float2int``); it MUST mirror the C++ ``set_torque`` path.
+        Handy for the ``dry_run`` calibration preview.  Does **not** apply
+        the torque-scale gain (pass already-scaled torque if you want that).
+        """
+        tau = np.asarray(list(tau), dtype=float)
+        raw = np.zeros(self.num_joints, dtype=np.int64)
+        for i in range(self.num_joints):
+            model = (self._dyn_motor_models[i]
+                     if self._dyn_motor_models is not None else "")
+            coeff = TORQUE_COEFF.get(model, 1.0)
+            v = tau[i] / (coeff * 0.01) if coeff != 0.0 else 0.0
+            raw[i] = int(np.clip(round(v), -32768, 32767))
+        return raw
+
+    @property
+    def has_dynamics(self) -> bool:
+        """``True`` once :meth:`setup_dynamics` has loaded a model."""
+        return self._pin_model is not None
+
+    def _require_dynamics(self) -> None:
+        if self._pin_model is None:
+            raise RuntimeError(
+                "dynamics model not loaded; call setup_dynamics() first")
+
+    @staticmethod
+    def _resolve_urdf_path(urdf_path: Optional[str]) -> Optional[str]:
+        """Find a URDF: explicit arg → vendored copy → stock Panthera-HT."""
+        if urdf_path:
+            return urdf_path if os.path.exists(urdf_path) else None
+
+        candidates: List[str] = []
+        # 1) vendored, for a self-contained deployment.
+        desc = os.path.join(_HERE, "fafu_robot_description")
+        if os.path.isdir(desc):
+            for fn in sorted(os.listdir(desc)):
+                if fn.endswith(".urdf"):
+                    candidates.append(os.path.join(desc, fn))
+        # 2) stock Panthera-HT follower URDF (walk up to the workspace root).
+        d = _HERE
+        for _ in range(6):
+            d = os.path.dirname(d)
+            stock = os.path.join(
+                d, "Panthera-HT_SDK", "panthera_python",
+                "Panthera-HT_description", "urdf",
+                "Panthera-HT_description_follower.urdf",
+            )
+            if os.path.exists(stock):
+                candidates.append(stock)
+                break
+        for c in candidates:
+            if os.path.exists(c):
+                return c
+        return None
+
+    # ------------------------------------------------------------------
+    #  Kinematics (FK / IK) -- needs setup_dynamics() (pinocchio + URDF)
+    # ------------------------------------------------------------------
+    def _require_kinematics(self) -> None:
+        self._require_dynamics()
+        if self._eef_frame_id is None:
+            raise RuntimeError(
+                "end-effector frame not resolved; call setup_dynamics() "
+                "(optionally with eef_frame=...) first")
+
+    def _q_in(self, q: Optional[Iterable[float]], is_radians: bool) -> np.ndarray:
+        """Normalize a joint vector arg to a radians ndarray of length
+        ``num_joints`` (defaults to the live measured pose)."""
+        if q is None:
+            return self.get_joint_values()
+        arr = np.asarray(list(q), dtype=float)
+        if arr.size != self.num_joints:
+            raise ValueError(
+                f"expected {self.num_joints} joint values, got {arr.size}")
+        return arr if is_radians else np.deg2rad(arr)
+
+    @staticmethod
+    def _rot_from_arg(rot, is_euler: bool, is_radians: bool) -> np.ndarray:
+        """Accept either a 3x3 rotation matrix or an Euler/RPY triple and
+        return a 3x3 rotation matrix."""
+        if rot is None:
+            return np.eye(3)
+        arr = np.asarray(rot, dtype=float)
+        if is_euler or arr.shape == (3,):
+            rpy = arr.reshape(3)
+            if not is_radians:
+                rpy = np.deg2rad(rpy)
+            return np.asarray(pin.rpy.rpyToMatrix(rpy[0], rpy[1], rpy[2]),
+                              dtype=float)
+        if arr.shape != (3, 3):
+            raise ValueError(
+                "rot must be a 3x3 rotation matrix or a length-3 RPY triple")
+        return arr
+
+    def _fk_se3(self, q_rad: np.ndarray):
+        """Internal: return the end-effector ``pin.SE3`` for ``q`` (rad)."""
+        pin.forwardKinematics(self._pin_model, self._pin_data, q_rad)
+        pin.updateFramePlacements(self._pin_model, self._pin_data)
+        return self._pin_data.oMf[self._eef_frame_id]
+
+    def _joint_limits_rad(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """Per-joint (lower, upper) soft limits in radians, or ``None`` if
+        any joint has no configured limit."""
+        lo = np.empty(self.num_joints)
+        hi = np.empty(self.num_joints)
+        for i, mid in enumerate(self._joint_motor_ids):
+            try:
+                lim = self.get_limit(mid, is_radians=True)
+            except Exception:
+                lim = None
+            if lim is None:
+                return None
+            lo[i], hi[i] = lim
+        return lo, hi
+
+    def forward_kinematics(
+        self,
+        q: Optional[Iterable[float]] = None,
+        *,
+        is_radians: bool = True,
+    ) -> Dict[str, object]:
+        """Forward kinematics of the end-effector frame.
+
+        Parameters
+        ----------
+        q : iterable of float, optional
+            Joint angles for the manipulator joints (in
+            :attr:`joint_motor_ids` order).  Defaults to the live pose.
+        is_radians : bool, optional
+            Interpret ``q`` in radians (default) or degrees.
+
+        Returns
+        -------
+        dict with keys
+            ``position`` (3,) end-effector position (m),
+            ``rotation`` (3, 3) rotation matrix,
+            ``rpy`` (3,) roll/pitch/yaw (rad),
+            ``transform`` (4, 4) homogeneous transform,
+            ``q`` (num_joints,) the joint configuration used (rad).
+        """
+        self._require_kinematics()
+        qv = self._q_in(q, is_radians)
+        oMf = self._fk_se3(qv)
+        pos = np.asarray(oMf.translation, dtype=float).copy()
+        rot = np.asarray(oMf.rotation, dtype=float).copy()
+        T = np.eye(4)
+        T[:3, :3] = rot
+        T[:3, 3] = pos
+        return {
+            "position": pos,
+            "rotation": rot,
+            "rpy": np.asarray(pin.rpy.matrixToRpy(rot), dtype=float),
+            "transform": T,
+            "q": qv,
+        }
+
+    def inverse_kinematics(
+        self,
+        target_position: Iterable[float],
+        target_rotation=None,
+        *,
+        is_euler: bool = False,
+        is_radians: bool = True,
+        init_q: Optional[Iterable[float]] = None,
+        max_iter: int = 1000,
+        eps: float = 1e-3,
+        damping: float = 1e-2,
+        adaptive_damping: bool = True,
+        multi_init: bool = True,
+        num_attempts: int = 8,
+        clamp_limits: bool = True,
+    ) -> Optional[np.ndarray]:
+        """Damped least-squares inverse kinematics for the end effector.
+
+        Parameters
+        ----------
+        target_position : iterable of 3 float
+            Desired end-effector position ``[x, y, z]`` (m).
+        target_rotation : array_like, optional
+            Desired orientation: a 3x3 rotation matrix, or an Euler/RPY
+            triple when ``is_euler=True``.  ``None`` -> identity.
+        is_euler, is_radians : bool, optional
+            Treat ``target_rotation`` as RPY (radians unless
+            ``is_radians=False``).  ``is_radians`` also sets the unit of
+            the returned joint vector.
+        init_q : iterable of float, optional
+            Seed configuration for the single-init solve.  Defaults to
+            the live pose.  Ignored when ``multi_init=True``.
+        max_iter, eps, damping, adaptive_damping : numeric, optional
+            Solver tuning (mirrors the vendor Panthera solver).
+        multi_init : bool, optional
+            Try several seeds (current pose, zero, limit mid-point, random
+            within limits) and keep the best -- far more robust.  Default
+            ``True``.
+        num_attempts : int, optional
+            Number of seeds for ``multi_init``.
+        clamp_limits : bool, optional
+            Abort an iterate that leaves the joint soft limits (matches the
+            vendor behaviour) when limits are configured.
+
+        Returns
+        -------
+        np.ndarray or None
+            ``num_joints`` joint angles (rad by default, deg if
+            ``is_radians=False``) on success, else ``None``.
+        """
+        self._require_kinematics()
+        R = self._rot_from_arg(target_rotation, is_euler, is_radians)
+        p = np.asarray(list(target_position), dtype=float).reshape(3)
+        oMdes = pin.SE3(R, p)
+
+        limits = self._joint_limits_rad() if clamp_limits else None
+
+        if multi_init:
+            q_sol = self._ik_multi_init(oMdes, num_attempts, max_iter, eps,
+                                        damping, adaptive_damping, limits)
+        else:
+            seed = (self.get_joint_values() if init_q is None
+                    else self._q_in(init_q, is_radians))
+            q_sol = self._ik_single(oMdes, seed, max_iter, eps, damping,
+                                    adaptive_damping, limits)
+
+        if q_sol is None:
+            return None
+        return q_sol if is_radians else np.rad2deg(q_sol)
+
+    def _ik_single(self, oMdes, seed, max_iter, eps, damping,
+                   adaptive_damping, limits) -> Optional[np.ndarray]:
+        """Single-seed damped least-squares loop (q in/out are rad)."""
+        q = np.asarray(seed, dtype=float).copy()
+        fid = self._eef_frame_id
+        dt = 1e-1
+        err_norm = float("inf")
+        for _ in range(max_iter):
+            pin.forwardKinematics(self._pin_model, self._pin_data, q)
+            pin.updateFramePlacements(self._pin_model, self._pin_data)
+            iMd = self._pin_data.oMf[fid].actInv(oMdes)
+            err = pin.log(iMd).vector
+            err_norm = float(np.linalg.norm(err))
+            if err_norm < eps:
+                return q
+            J = pin.computeFrameJacobian(self._pin_model, self._pin_data, q,
+                                         fid, pin.LOCAL)
+            J = -np.dot(pin.Jlog6(iMd.inverse()), J)
+            lam = (damping * (1.0 + 1.0 / (err_norm + 0.1))
+                   if adaptive_damping else damping)
+            JJT = J.dot(J.T) + (lam ** 2) * np.eye(6)
+            try:
+                alpha = np.linalg.solve(JJT, err)
+            except np.linalg.LinAlgError:
+                return None
+            v = -J.T.dot(alpha)
+            v_norm = np.linalg.norm(v)
+            if v_norm > 10.0:
+                v *= 10.0 / v_norm
+            q = pin.integrate(self._pin_model, q, v * dt)
+            if limits is not None:
+                lo, hi = limits
+                if np.any(q < lo) or np.any(q > hi):
+                    return None
+        return None
+
+    def _ik_multi_init(self, oMdes, num_attempts, max_iter, eps, damping,
+                       adaptive_damping, limits) -> Optional[np.ndarray]:
+        """Try several seeds; return the configuration with the smallest
+        Cartesian error (early-out once within ``eps``)."""
+        seeds: List[np.ndarray] = []
+        try:
+            seeds.append(self.get_joint_values())
+        except Exception:
+            pass
+        seeds.append(np.zeros(self.num_joints))
+        if limits is not None:
+            lo, hi = limits
+            seeds.append((lo + hi) / 2.0)
+            rng = np.random.default_rng()
+            while len(seeds) < num_attempts:
+                seeds.append(rng.uniform(lo, hi))
+        else:
+            while len(seeds) < num_attempts:
+                seeds.append(np.random.uniform(
+                    -np.pi / 4, np.pi / 4, self.num_joints))
+
+        best_q = None
+        best_err = float("inf")
+        p_des = np.asarray(oMdes.translation, dtype=float)
+        for seed in seeds[:num_attempts]:
+            q = self._ik_single(oMdes, seed, max_iter, eps, damping,
+                                 adaptive_damping, limits)
+            if q is None:
+                continue
+            actual = np.asarray(self._fk_se3(q).translation, dtype=float)
+            err = float(np.linalg.norm(actual - p_des))
+            if err < best_err:
+                best_err, best_q = err, q
+            if err < eps:
+                return q
+        return best_q
+
+    def get_gravity(self, q: Optional[Iterable[float]] = None) -> np.ndarray:
+        """Generalized gravity torque ``G(q)`` (Nm), one entry per joint.
+
+        Parameters
+        ----------
+        q : iterable of float, optional
+            Joint angles (rad).  Defaults to the live measured pose.
+        """
+        self._require_dynamics()
+        qv = (self.get_joint_values() if q is None
+              else np.asarray(list(q), dtype=float))
+        original_linear = self._pin_model.gravity.linear.copy()
+        self._pin_model.gravity.linear = self._dyn_gravity_vec
+        try:
+            g = pin.computeGeneralizedGravity(self._pin_model, self._pin_data, qv)
+        finally:
+            self._pin_model.gravity.linear = original_linear
+        return np.asarray(g, dtype=float)
+
+    def get_mass_matrix(self, q: Optional[Iterable[float]] = None) -> np.ndarray:
+        """Joint-space inertia matrix ``M(q)`` (CRBA)."""
+        self._require_dynamics()
+        qv = (self.get_joint_values() if q is None
+              else np.asarray(list(q), dtype=float))
+        M = pin.crba(self._pin_model, self._pin_data, qv)
+        n = len(qv)
+        return np.asarray(M[:n, :n], dtype=float)
+
+    def get_coriolis(
+        self,
+        q: Optional[Iterable[float]] = None,
+        v: Optional[Iterable[float]] = None,
+    ) -> np.ndarray:
+        """Coriolis/centrifugal matrix ``C(q, v)``."""
+        self._require_dynamics()
+        qv = (self.get_joint_values() if q is None
+              else np.asarray(list(q), dtype=float))
+        vv = (self.get_joint_velocities() if v is None
+              else np.asarray(list(v), dtype=float))
+        C = pin.computeCoriolisMatrix(self._pin_model, self._pin_data, qv, vv)
+        return np.asarray(C, dtype=float)
+
+    def get_dynamics(
+        self,
+        q: Optional[Iterable[float]] = None,
+        v: Optional[Iterable[float]] = None,
+        a: Optional[Iterable[float]] = None,
+    ) -> np.ndarray:
+        """Full inverse dynamics ``tau = M(q)a + C(q,v)v + G(q)`` (RNEA)."""
+        self._require_dynamics()
+        qv = (self.get_joint_values() if q is None
+              else np.asarray(list(q), dtype=float))
+        vv = (self.get_joint_velocities() if v is None
+              else np.asarray(list(v), dtype=float))
+        av = (np.zeros(self.num_joints) if a is None
+              else np.asarray(list(a), dtype=float))
+        original_linear = self._pin_model.gravity.linear.copy()
+        self._pin_model.gravity.linear = self._dyn_gravity_vec
+        try:
+            tau = pin.rnea(self._pin_model, self._pin_data, qv, vv, av)
+        finally:
+            self._pin_model.gravity.linear = original_linear
+        return np.asarray(tau, dtype=float)
+
+    def get_friction_compensation(
+        self,
+        vel: Optional[Iterable[float]] = None,
+        *,
+        params: Optional[FrictionParams] = None,
+    ) -> np.ndarray:
+        """Coulomb + viscous friction torque (Nm), per joint.
+
+        ``tau = fc*sign(v) + fv*v`` with the low-speed dead-band described
+        in :class:`FrictionParams`.  Pure numpy — does **not** need
+        pinocchio, so it works even on a Windows box without dynamics.
+
+        Parameters
+        ----------
+        vel : iterable of float, optional
+            Joint velocities (rad/s).  Defaults to the live measured
+            velocities.
+        params : FrictionParams, optional
+            Override the model.  Defaults to the one given to
+            :meth:`setup_dynamics`, else :meth:`FrictionParams.reference_6dof`.
+        """
+        if vel is None:
+            vel = self.get_joint_velocities()
+        vel = np.asarray(list(vel), dtype=float)
+
+        p = params or self._friction_params or FrictionParams.reference_6dof()
+        fc = np.asarray(p.fc, dtype=float)
+        fv = np.asarray(p.fv, dtype=float)
+        if fc.shape != vel.shape or fv.shape != vel.shape:
+            raise ValueError(
+                f"friction fc/fv length {fc.shape}/{fv.shape} != velocity "
+                f"length {vel.shape}")
+
+        full = fc * np.sign(vel) + fv * vel
+        low = fv * vel
+        return np.where(np.abs(vel) < p.vel_threshold, low, full)
+
+    def compute_compensation_torque(
+        self,
+        q: Optional[Iterable[float]] = None,
+        v: Optional[Iterable[float]] = None,
+        *,
+        friction: bool = True,
+    ) -> np.ndarray:
+        """Gravity (+ optional friction) feed-forward torque, clipped (Nm).
+
+        ``tau = clip( G(q) + [friction(v)], ±tau_limit )``.
+        """
+        self._require_dynamics()
+        tau = self.get_gravity(q)
+        if friction:
+            tau = tau + self.get_friction_compensation(v)
+        if self._dyn_tau_limit is not None:
+            tau = np.clip(tau, -self._dyn_tau_limit, self._dyn_tau_limit)
+        return tau
+
+    def apply_compensation_torque(
+        self,
+        tau: Iterable[float],
+        *,
+        damping_kd: float = 0.0,
+    ) -> None:
+        """Stream a feed-forward torque vector (Nm) to every joint motor.
+
+        Uses the pure-torque channel ``set_torque`` (firmware mode ``0x0A``,
+        frame matches the control-board ``set_torque_int16``: pos=NAN, vel=0,
+        kp=0, kd=0, maxtqe=NAN).  We deliberately do **not** use the MIT
+        ``set_pos_vel_tqe_kp_kd`` channel (mode ``0x15``): on this arm's motor
+        firmware mode ``0x15`` is not actuated (commands are silently ignored),
+        which is why gravity compensation previously produced "no force".
+
+        ``damping_kd`` is kept for API compatibility but has no firmware effect
+        on this channel; add velocity damping via the software impedance net
+        (``b_soft`` in :meth:`start_gravity_compensation`) instead.
+
+        One CAN frame per joint; fine for the moderate-rate float loop.
+        """
+        tau = np.asarray(list(tau), dtype=float)
+        if tau.shape != (self.num_joints,):
+            raise ValueError(
+                f"tau must have {self.num_joints} elements, got {tau.shape}")
+        # Empirical calibration gain (1.0 by default).
+        tau = tau * self._dyn_torque_scale
+        for i, mid in enumerate(self._joint_motor_ids):
+            model = (self._dyn_motor_models[i]
+                     if self._dyn_motor_models is not None else "")
+            try:
+                self._ht.set_torque(mid, float(tau[i]), model)
+            except Exception as e:
+                print(f"[FafuRobot] apply_compensation_torque: motor {mid} "
+                      f"failed: {e}")
+
+    def gravity_compensation_step(
+        self,
+        *,
+        friction: bool = True,
+        damping_kd: float = 0.0,
+        dry_run: bool = False,
+    ) -> np.ndarray:
+        """One tick of gravity(+friction) compensation; returns tau (Nm).
+
+        Reads the live pose/velocity, computes the clipped feed-forward
+        torque and (unless ``dry_run``) sends it.  Call this yourself in a
+        custom loop, or use :meth:`start_gravity_compensation` for a
+        ready-made blocking loop.
+        """
+        self._require_dynamics()
+        q = self.get_joint_values()
+        v = self.get_joint_velocities()
+        tau = self.compute_compensation_torque(q, v, friction=friction)
+        if not dry_run:
+            self.apply_compensation_torque(tau, damping_kd=damping_kd)
+        return tau
+
+    # ---- tuned gravity-comp defaults (6-DOF follower arm) --------------
+    # Empirically calibrated lead-through / float-mode impedance net:
+    #   * heavy gravity joints J2/J3/J4 get a stiff spring K + integral Ki
+    #     (the integral removes the static-friction droop without the
+    #     high-K divergence the latency-limited loop suffers);
+    #   * the light base/wrist joints J1/J5/J6 get a soft K, light damping
+    #     and NO integral (so they don't hunt/drift in their friction
+    #     deadband).
+    # Only auto-applied when the arm actually has 6 joints; otherwise the
+    # caller must pass their own arrays.  Requires torque_scale ~= 90 from
+    # setup_dynamics() to feel right.
+    _GRAVITY_COMP_DOF = 6
+    _GRAVITY_COMP_TORQUE_SCALE = 90.0
+    _GRAVITY_COMP_K_DEFAULT = (1.5, 8.0, 10.0, 10.0, 1.5, 1.5)
+    _GRAVITY_COMP_B_DEFAULT = (0.4, 0.4, 0.6, 0.8, 0.2, 0.2)
+    # Ki raised ~1.7x on J2/J3/J4 vs the first tune: with a small held error
+    # (e.g. 0.7 deg of stiction deadband) the integral ramp rate is Ki*err, so a
+    # low Ki took >10 s to build enough torque to break static friction and
+    # close the gap ("have to hold it for ages before it locks").  The higher Ki
+    # ramps to the SAME i_clamp ceiling far quicker (settles in ~2-3 s) without
+    # raising the max authority.  If a joint starts to hunt/overshoot at these
+    # values, dial it back per-joint via --i-soft.
+    _GRAVITY_COMP_I_DEFAULT = (0.0, 2.5, 3.5, 6.0, 0.0, 0.0)
+
+    def start_gravity_compensation(
+        self,
+        *,
+        friction: bool = True,
+        rate_hz: float = 200.0,
+        duration: Optional[float] = None,
+        damping_kd: float = 0.0,
+        dry_run: bool = False,
+        verbose: bool = False,
+        abort_check: Optional[Callable[[], bool]] = None,
+        k_soft: Optional[Iterable[float]] = None,
+        b_soft: Optional[Iterable[float]] = None,
+        q_des: Optional[Iterable[float]] = None,
+        tau_lpf_alpha: float = 0.4,
+        tau_slew_per_s: Optional[float] = 40.0,
+        i_soft: Optional[Iterable[float]] = None,
+        i_clamp: float = 3.0,
+        vel_abort_rps: float = 4.0,
+        vel_lpf_alpha: float = 0.3,
+        hold_on_release: bool = True,
+        move_vel_thresh: float = 0.15,
+        home_on_exit: bool = False,
+        home_speed: int = 15,
+        home_brake_pause: float = 0.0,
+    ) -> None:
+        """Run a blocking gravity(+friction) compensation loop ("float mode").
+
+        The arm becomes weightless and can be guided by hand — the classic
+        teaching / lead-through mode.  Mirrors the reference
+        ``while True: ...`` loop but adds rate control, a duration cap, a
+        ``dry_run`` preview and Ctrl+C-safe teardown.
+
+        ★ SAFETY ★
+          * Always test with ``dry_run=True`` first and read the printed
+            torques: if any column is wildly larger than the joint's
+            ``tau_limit`` your ``motor_models`` / URDF are wrong.
+          * On exit (normal, Ctrl+C, or exception) every joint is put in
+            ``stop`` (free) mode and the firmware will hold nothing — keep a
+            hand on the arm / E-stop, heavy links will drop.
+          * The gripper is never touched.
+
+        Parameters
+        ----------
+        friction : bool, optional
+            Add the friction feed-forward term.  Default ``True``.
+        rate_hz : float, optional
+            Loop rate.  Default ``200`` Hz (matches the reference's ~5 ms
+            sleep).  Each tick sends ``num_joints`` CAN frames.
+        duration : float, optional
+            Stop after this many seconds.  ``None`` (default) runs until
+            Ctrl+C or ``abort_check``.
+        damping_kd : float, optional
+            Extra firmware velocity damping (>= 0).  ``0`` = reference.
+        dry_run : bool, optional
+            Compute and (if ``verbose``) print torque but do **not** send
+            anything.  Default ``False``.
+        verbose : bool, optional
+            Print q / v / tau every ~0.5 s.  Default ``False``.
+        abort_check : callable, optional
+            Called every tick; return ``True`` to stop early.
+        k_soft, b_soft : iterable of float, optional
+            Software **impedance / PD safety net** (Nm/rad, Nm·s/rad), one
+            per joint.  ``tau += K*(q_des - q) + B*(-v_filt)`` is added to the
+            gravity feed-forward (firmware kp=kd=0).  Keeps the arm pulled
+            toward ``q_des`` so it **cannot run away**.  On a 6-DOF arm
+            ``None`` (default) auto-applies the tuned lead-through net
+            (``_GRAVITY_COMP_K_DEFAULT`` / ``_GRAVITY_COMP_B_DEFAULT``);
+            pass an explicit all-zeros array to opt out (pure float mode).
+        q_des : iterable of float, optional
+            Hold target (rad) for the PD net.  ``None`` (default) captures the
+            pose at loop start, i.e. "hold where it is now".
+        tau_lpf_alpha : float, optional
+            First-order low-pass on the commanded torque (0..1, 1 = no
+            filter).  Lower = smoother.  Default ``0.4``.
+        tau_slew_per_s : float, optional
+            Max torque change rate (Nm/s).  Caps single-tick jumps to damp
+            limit-cycle oscillation.  ``None`` / <=0 disables.  Default ``40``.
+        i_soft : iterable of float, optional
+            Software **integral** gain (Nm per rad·s), one per joint.  Use
+            this — NOT a bigger ``k_soft`` — to remove the static-friction
+            "droop" (steady-state offset): a large K diverges on this
+            high-latency loop, but the integral only acts at low frequency so
+            it eliminates the deadband without oscillating.  Only integrates
+            while the joint is (nearly) at rest, so the arm stays compliant
+            when you push it.  On a 6-DOF arm ``None`` (default) auto-applies
+            ``_GRAVITY_COMP_I_DEFAULT`` (integral only on the gravity joints
+            J2/J3/J4); pass all-zeros to disable.
+        i_clamp : float, optional
+            Per-joint cap on the integral torque contribution (Nm,
+            anti-windup).  Default ``3.0``.  This bounds how much static droop
+            the integral can fight; too small and a joint with a large
+            model/friction deficit keeps slowly sagging because the integral
+            saturates before it generates enough holding torque.
+        vel_abort_rps : float, optional
+            **Runaway guard** (safety): if any joint's |velocity| exceeds this
+            (rev/s) the loop aborts and re-holds — catches divergence before
+            the arm flings itself.  ``0`` disables.  Default ``4.0``.
+        vel_lpf_alpha : float, optional
+            Low-pass on the velocity used by the ``b_soft`` damping term
+            (0..1, lower = smoother).  The raw firmware velocity is noisy; a
+            light filter lets ``b_soft`` actually damp the pure-P limit-cycle
+            (e.g. J1 hunting) instead of chattering.  Default ``0.3``.
+        hold_on_release : bool, optional
+            **Lead-through teach mode.**  When ``True`` (default) the hold
+            target ``q_des`` continuously follows the live pose for any joint
+            whose speed exceeds ``move_vel_thresh`` (so while you drag it the
+            spring force is ~0 and the arm is weightless), and freezes the
+            instant the joint stops — the spring + integral then lock it
+            exactly where you let go.  Drag again to a new pose and it holds
+            there.  Set ``False`` for the classic fixed-``q_des`` behaviour
+            (springs back to the start pose when pushed away).
+        move_vel_thresh : float, optional
+            Speed (rev/s) above which a joint is considered "being dragged"
+            for ``hold_on_release``.  Default ``0.15``.  Raise it if the arm
+            slowly creeps/drifts when untouched; lower it if dragging feels
+            stiff before it starts following.
+        home_on_exit : bool, optional
+            When ``True``, on loop exit (normal, Ctrl+C, or ``abort_check``)
+            the teardown sequence is: **brake every joint** (arrest motion
+            gently) → **pause ``home_brake_pause`` s** → re-enable position
+            mode and **slowly drive every joint back to 0 rad**
+            (via :meth:`go_home`) → brake again at home.  Default ``False``
+            (just brake in place).  Ignored in ``dry_run``.
+        home_speed : int, optional
+            Speed percentage (0..100] for the ``home_on_exit`` return move.
+            Default ``15`` (slow / gentle).
+        home_brake_pause : float, optional
+            Seconds to stay braked after Ctrl+C before starting the homing
+            move (``home_on_exit`` only).  Default ``0.0`` (home immediately
+            after braking).
+        """
+        self._require_dynamics()
+        if not self.is_enabled:
+            print("[FafuRobot] start_gravity_compensation: enabling motors ...")
+            self.enable()
+
+        # Auto-apply the tuned 6-DOF lead-through net when the caller did not
+        # override it.  Pass an explicit array (e.g. all-zeros) to opt out.
+        if self.num_joints == self._GRAVITY_COMP_DOF:
+            if k_soft is None:
+                k_soft = self._GRAVITY_COMP_K_DEFAULT
+            if b_soft is None:
+                b_soft = self._GRAVITY_COMP_B_DEFAULT
+            if i_soft is None:
+                i_soft = self._GRAVITY_COMP_I_DEFAULT
+            # The tuned net is calibrated for torque_scale ~= 90; warn if the
+            # arm is still on the uncalibrated default (would feel "no force").
+            if float(np.min(self._dyn_torque_scale)) < 10.0:
+                print("[FafuRobot] WARN: torque_scale looks uncalibrated "
+                      f"({self._dyn_torque_scale.tolist()}); the tuned "
+                      f"gravity-comp net expects ~{self._GRAVITY_COMP_TORQUE_SCALE}. "
+                      "Call setup_dynamics(..., torque_scale=90) or "
+                      "set_torque_scale(90) first, or the arm will feel weak.")
+
+        def _broadcast(val, name):
+            if val is None:
+                return None
+            arr = np.atleast_1d(np.asarray(list(val), dtype=float))
+            if arr.shape == (1,):                       # scalar -> all joints
+                arr = np.full(self.num_joints, arr[0], dtype=float)
+            if arr.shape != (self.num_joints,):
+                raise ValueError(
+                    f"{name} must be a scalar or have {self.num_joints} "
+                    f"elements, got {arr.shape}")
+            return arr
+
+        k_soft_np = _broadcast(k_soft, "k_soft")
+        b_soft_np = _broadcast(b_soft, "b_soft")
+        i_soft_np = _broadcast(i_soft, "i_soft")
+        q_des_np: Optional[np.ndarray] = None
+        if k_soft_np is not None or i_soft_np is not None:
+            q_des_np = (np.asarray(list(q_des), dtype=float)
+                        if q_des is not None else self.get_joint_values().copy())
+            print(f"[FafuRobot] impedance net ON: "
+                  f"K={(k_soft_np.tolist() if k_soft_np is not None else None)} "
+                  f"B={(b_soft_np.tolist() if b_soft_np is not None else None)} "
+                  f"Ki={(i_soft_np.tolist() if i_soft_np is not None else None)} "
+                  f"q_des(deg)={np.degrees(q_des_np).round(1).tolist()}")
+
+        if dry_run:
+            print("[FafuRobot] gravity-comp DRY-RUN: computing torque, "
+                  "NOT sending to motors.")
+        else:
+            print("[FafuRobot] gravity-comp LIVE: arm will go weightless. "
+                  "Keep a hand on it / the E-stop. Ctrl+C to stop.")
+
+        period = 1.0 / max(1.0, float(rate_hz))
+        # Anti-convulsion: limit how fast the commanded torque may change
+        # between ticks (slew) and low-pass it.  With high torque_scale the
+        # K/B impedance + friction sign terms can otherwise flip the command
+        # by hundreds of raw counts in one tick, which excites a limit-cycle
+        # oscillation ("convulsion") through the USB-CAN latency.
+        max_dtau = (tau_slew_per_s * period
+                    if tau_slew_per_s and tau_slew_per_s > 0 else None)
+        alpha = float(np.clip(tau_lpf_alpha, 0.0, 1.0))
+        tau_prev: Optional[np.ndarray] = None
+        # Integral state (kills the static-friction "droop" deadband without
+        # the high-frequency gain that makes a large K diverge on this
+        # high-latency loop).  Only integrates while (nearly) at rest so it
+        # stays compliant while you push, and never winds up.
+        integ = np.zeros(self.num_joints, dtype=float)
+        rest_thresh = 0.05            # rev/s: below this = "at rest", integrate
+        # Per-joint lead-through state machine: a joint enters "dragging" only
+        # after its speed has stayed ABOVE `move_vel_thresh` continuously for
+        # `enter_time` seconds, and LOCKS again once its speed has stayed below
+        # that threshold continuously for `settle_time` seconds.
+        #
+        # The enter DEBOUNCE is the key fix for "gradually droops, never
+        # stabilises": under gravity a joint creeps down in stick-slip jerks,
+        # and a single slip spike easily exceeds `move_vel_thresh` for one
+        # tick.  With an instantaneous enter-test that spike would flip the
+        # joint into "dragging", snap q_des down to the (sagged) live pose and
+        # zero the integral -- so every micro-slip ratchets the hold point
+        # lower and the joint walks down forever.  Requiring the fast motion to
+        # PERSIST for `enter_time` rejects those momentary slips (they stop
+        # almost immediately) while a real hand-drag (sustained) still engages.
+        dragging = np.zeros(self.num_joints, dtype=bool)
+        slow_time = np.zeros(self.num_joints, dtype=float)
+        fast_time = np.zeros(self.num_joints, dtype=float)
+        enter_time = 0.08            # s above move_vel_thresh -> start drag
+        settle_time = 0.25           # s below move_vel_thresh -> lock & hold
+        # Filtered velocity for the damping (B) term: the raw firmware
+        # velocity is quantized/noisy, and feeding it straight into B*(-v)
+        # either does nothing or chatters.  A light LPF gives B clean phase to
+        # actually damp the P limit-cycle.
+        v_alpha = float(np.clip(vel_lpf_alpha, 0.01, 1.0))
+        v_filt = np.zeros(self.num_joints, dtype=float)
+        t0 = time.monotonic()
+        last_t = t0
+        last_log = t0
+        self._gravity_comp_active = True
+        try:
+            while True:
+                tick_start = time.monotonic()
+                if abort_check is not None and abort_check():
+                    print("[FafuRobot] gravity-comp: abort_check -> stop")
+                    break
+                if duration is not None and (tick_start - t0) >= duration:
+                    break
+
+                q = self.get_joint_values()
+                v = self.get_joint_velocities()
+                # ---- runaway / divergence guard (safety) ----
+                if vel_abort_rps and vel_abort_rps > 0:
+                    vmax = float(np.max(np.abs(v)))
+                    if vmax > vel_abort_rps:
+                        print(f"[FafuRobot] gravity-comp: RUNAWAY guard "
+                              f"(|v|={vmax:.2f} > {vel_abort_rps} rev/s) "
+                              f"-> abort & re-hold")
+                        break
+                dt = tick_start - last_t
+                last_t = tick_start
+                v_filt = v_alpha * v + (1.0 - v_alpha) * v_filt
+                absv = np.abs(v)
+                # ---- lead-through teach (debounced): a joint enters "dragging"
+                # only after SUSTAINED fast motion (`enter_time`), so momentary
+                # gravity stick-slip spikes can't ratchet the hold point down;
+                # while dragging its q_des follows the live pose (spring -> 0,
+                # weightless to move); once it stays slow for `settle_time` it
+                # locks q_des where you let go and the spring + integral hold it
+                # there.  A slow gravity sag never sustains above the threshold,
+                # so it is treated as "held" and the integral pulls it back out.
+                if hold_on_release and q_des_np is not None:
+                    fast = absv > move_vel_thresh
+                    fast_time = np.where(fast, fast_time + dt, 0.0)
+                    slow_time = np.where(fast, 0.0, slow_time + dt)
+                    # sustained fast -> enter drag; sustained slow -> lock
+                    dragging = np.where(fast_time >= enter_time, True, dragging)
+                    dragging = np.where(slow_time >= settle_time, False, dragging)
+                    q_des_np = np.where(dragging, q, q_des_np)
+                    # ZERO the integral while dragging.  The integral is a
+                    # *position-error* term, NOT a transferable gravity-model
+                    # bias: carrying it from one pose to a very different one
+                    # (e.g. dragging from q3=140 deg back to q3~0) discharges a
+                    # huge wound-up value as a violent forward "spring kick".
+                    # Resetting on drag keeps it pose-local and safe; the
+                    # slightly slower re-lock is handled by a higher Ki, not by
+                    # carrying stale integral across the workspace.
+                    integ = np.where(dragging, 0.0, integ)
+                    hold_mask = ~dragging
+                else:
+                    hold_mask = absv < rest_thresh
+                tau = self.compute_compensation_torque(q, v, friction=friction)
+                if k_soft_np is not None:
+                    tau = tau + k_soft_np * (q_des_np - q)
+                    if b_soft_np is not None:
+                        tau = tau + b_soft_np * (-v_filt)
+                if i_soft_np is not None and dt > 0.0:
+                    err = q_des_np - q
+                    # integrate while "held" (locked, incl. slow gravity sag)
+                    # so the droop is actively removed; bleed off otherwise so
+                    # it never winds up.
+                    integ = np.where(hold_mask, integ + err * dt, integ * 0.95)
+                    # anti-windup: clamp so |Ki*integ| <= i_clamp (per joint)
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        cap = np.where(i_soft_np > 0.0,
+                                       i_clamp / np.maximum(i_soft_np, 1e-9),
+                                       0.0)
+                    integ = np.clip(integ, -cap, cap)
+                    tau = tau + i_soft_np * integ
+                if self._dyn_tau_limit is not None:
+                    tau = np.clip(tau, -self._dyn_tau_limit, self._dyn_tau_limit)
+                # smooth + slew-limit before sending
+                if tau_prev is not None:
+                    if alpha < 1.0:
+                        tau = alpha * tau + (1.0 - alpha) * tau_prev
+                    if max_dtau is not None:
+                        tau = np.clip(tau, tau_prev - max_dtau, tau_prev + max_dtau)
+                tau_prev = tau.copy()
+                if not dry_run:
+                    self.apply_compensation_torque(tau, damping_kd=damping_kd)
+
+                if verbose and (tick_start - last_log) >= 0.5:
+                    last_log = tick_start
+                    raw = self.tau_to_raw(tau * self._dyn_torque_scale)
+                    print(f"[grav] q(deg)={np.degrees(q).round(1).tolist()} "
+                          f"tau(Nm)={tau.round(3).tolist()} "
+                          f"x{self._dyn_torque_scale.tolist()} "
+                          f"-> raw={raw.tolist()}")
+
+                # rate control
+                sleep_s = period - (time.monotonic() - tick_start)
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+        except KeyboardInterrupt:
+            print("\n[FafuRobot] gravity-comp interrupted by user")
+        finally:
+            self._gravity_comp_active = False
+            # SAFER teardown: instead of dropping to free-spin (limp -> heavy
+            # links fall), re-engage *position hold* at the current pose via
+            # the verified position channel (set_pos_vel_acc, NOT a torque
+            # frame).  This stops any leftover feed-forward torque and keeps
+            # the arm where it is.
+            if dry_run:
+                pass
+            elif home_on_exit:
+                # Sequence: brake (arrest motion gently) -> pause -> re-enable
+                # position mode -> slow S-curve home to 0 -> brake at home.
+                # NOTE: brake is mode 0x0F; position frames only actuate in
+                # 0x0A, so we MUST re-enable before go_home or it won't move.
+                self._brake_joints()
+                pause = max(0.0, float(home_brake_pause))
+                if pause > 0.0:
+                    print(f"[FafuRobot] gravity-comp: braked; pausing "
+                          f"{pause:.1f}s before homing ...")
+                    time.sleep(pause)
+                else:
+                    print("[FafuRobot] gravity-comp: braked.")
+                print("[FafuRobot] gravity-comp: switching to position & "
+                      f"returning home (0 rad) @ speed={home_speed} ... "
+                      "(do NOT press Ctrl+C again)")
+                try:
+                    # brake (0x0F) -> position (0x0A).  Use _switch_mode_all
+                    # DIRECTLY rather than enable(): enable()'s Stage-0 pre-reads
+                    # every motor (7 x 0.2s ~= 1.4s of "nothing happening")
+                    # which is the dead window that tempts a second Ctrl+C and
+                    # aborts the homing.  Only fall back to the heavier enable()
+                    # (motor_reset recovery) if the quick switch genuinely fails.
+                    if not self._switch_mode_all(self.MODE_POSITION,
+                                                 label="position", max_retry=3):
+                        self.enable()
+                    self.go_home(speed=home_speed, block=True)
+                    print("[FafuRobot] gravity-comp homed to 0 rad.")
+                except KeyboardInterrupt:
+                    print("\n[FafuRobot] homing interrupted.")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[FafuRobot] homing failed ({exc}).")
+                # brake at the final pose
+                self._brake_joints()
+                print("[FafuRobot] gravity-comp stopped (joints braked).")
+            else:
+                # Kill the float torque and engage short-circuit brake on
+                # every joint (freeze-in-place, no stiff grab jolt).
+                self._brake_joints()
+                print("[FafuRobot] gravity-comp stopped (joints braked).")
+
+    @property
+    def is_gravity_compensating(self) -> bool:
+        """``True`` while :meth:`start_gravity_compensation` loop is running."""
+        return self._gravity_comp_active
+
+    def _brake_joints(self) -> None:
+        """Put every manipulator joint into short-circuit brake mode (0x0F),
+        falling back to ``stop`` per motor.  The gripper is left untouched.
+
+        Note: brake is velocity-damping, not a position lock — heavy joints
+        under sustained gravity can still creep slowly; it never goes fully
+        limp, applies no holding current, and engages without the stiff
+        "grab" jolt of a position-hold."""
+        for mid in self._joint_motor_ids:
+            try:
+                self._ht.set_motor_mode(mid, self.MODE_BRAKE)
+            except Exception:
+                try:
+                    self._ht.stop(mid)
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
     #  Cartesian motion (placeholders)
     # ------------------------------------------------------------------
     def move_p(
         self,
         pos: Iterable[float],
-        rot: np.ndarray,
+        rot=None,
         *,
         is_euler: bool = False,
+        is_radians: bool = True,
         speed: int = 50,
-    ) -> None:
-        """Move the end effector to a Cartesian pose (placeholder).
+        block: bool = True,
+        init_q: Optional[Iterable[float]] = None,
+        **ik_kwargs,
+    ) -> np.ndarray:
+        """Move the end effector to a Cartesian pose (IK + joint move).
+
+        Parameters
+        ----------
+        pos : iterable of 3 float
+            Target end-effector position ``[x, y, z]`` (m).
+        rot : array_like, optional
+            Target orientation: a 3x3 rotation matrix, or an Euler/RPY
+            triple when ``is_euler=True``.  ``None`` keeps the identity
+            orientation.
+        is_euler, is_radians : bool, optional
+            Treat ``rot`` as RPY (radians unless ``is_radians=False``).
+        speed : int, optional
+            Speed percentage forwarded to :meth:`move_j`.
+        block : bool, optional
+            Forwarded to :meth:`move_j`.
+        init_q : iterable of float, optional
+            IK seed; defaults to the live pose.
+        **ik_kwargs
+            Extra keyword args forwarded to :meth:`inverse_kinematics`
+            (e.g. ``multi_init``, ``eps``, ``damping``).
+
+        Returns
+        -------
+        np.ndarray
+            The joint solution (rad) that was commanded.
 
         Raises
         ------
-        NotImplementedError
-            The Fafu stack ships motor-level controls only;
-            inverse kinematics must be supplied by the caller.  Once
-            an IK solver returns ``q`` (joint angles), feed it to
-            :meth:`move_j`.
+        RuntimeError
+            IK failed to converge (target likely outside the workspace).
         """
-        # TODO: plug in an external IK solver (e.g. wrs / pinocchio)
-        # to convert (pos, rot) -> joint targets, then dispatch via
-        # self.move_j(targets, ...).
-        raise NotImplementedError(
-            "FafuRobotController has no built-in IK; "
-            "compute joint angles externally and call move_j()."
+        self._require_kinematics()
+        q = self.inverse_kinematics(
+            pos, rot, is_euler=is_euler, is_radians=True,
+            init_q=init_q, **ik_kwargs,
         )
+        if q is None:
+            raise RuntimeError(
+                "move_p: IK failed to converge; target pose is likely "
+                "outside the reachable workspace or near a singularity.")
+        self.move_j(q, is_radians=True, speed=speed, block=block)
+        return q
 
     def move_l(
         self,
         pos: Iterable[float],
-        rot: np.ndarray,
+        rot=None,
         *,
         is_euler: bool = False,
+        is_radians: bool = True,
         speed: int = 50,
-    ) -> None:
-        """Linear Cartesian motion (placeholder).
+        steps: int = 20,
+        **ik_kwargs,
+    ) -> np.ndarray:
+        """Move the end effector along a straight Cartesian line.
+
+        Samples the geodesic from the current pose to ``(pos, rot)`` in
+        ``steps`` waypoints, solves IK for each (seeded from the previous
+        waypoint for continuity) and runs the resulting joint path.
+
+        Parameters
+        ----------
+        pos, rot, is_euler, is_radians, speed
+            See :meth:`move_p`.
+        steps : int, optional
+            Number of Cartesian waypoints (>= 1).  More steps == straighter
+            line but more IK solves.  Default 20.
+        **ik_kwargs
+            Forwarded to :meth:`inverse_kinematics` for each waypoint.
+
+        Returns
+        -------
+        np.ndarray
+            The joint-space path actually commanded, shape ``(steps, num_joints)``.
 
         Raises
         ------
-        NotImplementedError
-            See :meth:`move_p`.
+        RuntimeError
+            IK failed at some waypoint (path leaves the workspace).
         """
-        # TODO: implement by sampling the Cartesian line, IK-ing each
-        # waypoint and feeding the resulting joint path to
-        # move_jntspace_path().
-        raise NotImplementedError(
-            "FafuRobotController has no built-in IK; "
-            "build a Cartesian-line waypoint list, IK each pose and "
-            "call move_jntspace_path()."
-        )
+        self._require_kinematics()
+        steps = max(1, int(steps))
+        R = self._rot_from_arg(rot, is_euler, is_radians)
+        p = np.asarray(list(pos), dtype=float).reshape(3)
+        goal = pin.SE3(R, p)
+
+        q_now = self.get_joint_values()
+        start = self._fk_se3(q_now)
+        # Geodesic twist from start to goal in the start frame.
+        rel = pin.log6(start.actInv(goal))
+
+        # multi_init off for waypoints: we want continuity from the seed.
+        ik_kwargs.setdefault("multi_init", False)
+
+        path: List[np.ndarray] = []
+        prev_q = q_now
+        for k in range(1, steps + 1):
+            u = k / steps
+            Tk = start * pin.exp6(rel * u)
+            q = self.inverse_kinematics(
+                Tk.translation, Tk.rotation, is_radians=True,
+                init_q=prev_q, **ik_kwargs,
+            )
+            if q is None:
+                raise RuntimeError(
+                    f"move_l: IK failed at waypoint {k}/{steps}; the "
+                    "straight-line path leaves the reachable workspace.")
+            path.append(q)
+            prev_q = q
+
+        path_arr = np.asarray(path, dtype=float)
+        try:
+            self.move_jntspace_path(path_arr, is_radians=True, speed=speed)
+        except NotImplementedError:
+            # No TOPPRA/wrs: fall back to sequential blocking joint moves.
+            print("[FafuRobot] move_l: TOPPRA/wrs unavailable; falling back "
+                  "to sequential move_j per waypoint.")
+            for q in path_arr:
+                self.move_j(q, is_radians=True, speed=speed, block=True)
+        return path_arr
 
     # ------------------------------------------------------------------
     #  Feedback
@@ -1337,19 +2659,17 @@ class FafuRobotController:
         """Return raw :class:`MotorState` objects keyed by motor id."""
         return self._read_states(self._cfg.motor_ids, prefer_cache=prefer_cache)
 
-    def get_pose(self):
-        """Return end-effector pose (placeholder).
+    def get_pose(self, *, prefer_cache: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+        """Return the live end-effector pose as ``(position, rotation)``.
 
-        Raises
-        ------
-        NotImplementedError
-            Forward kinematics are not built in; compute them from
-            :meth:`get_joint_values` using your URDF / wrs model.
+        ``position`` is a length-3 vector in metres and ``rotation`` a
+        3x3 matrix, both in the URDF base frame.  Requires
+        :meth:`setup_dynamics` (pinocchio + URDF).
         """
-        raise NotImplementedError(
-            "FafuRobotController has no built-in FK; "
-            "use get_joint_values() and an external kinematics model."
-        )
+        self._require_kinematics()
+        q = self.get_joint_values(prefer_cache=prefer_cache)
+        fk = self.forward_kinematics(q)
+        return fk["position"], fk["rotation"]
 
     # ------------------------------------------------------------------
     #  Gripper

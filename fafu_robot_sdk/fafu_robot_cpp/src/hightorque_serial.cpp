@@ -94,8 +94,12 @@ const std::vector<std::size_t> CANFD_DLC_SIZES = {
 };
 
 const std::map<std::string, double> TORQUE_COEFF = {
+    // ---- Fafu arm actual motors (measured, authoritative) ----
+    {"M5036_02", 0.67},     // J1, J4
+    {"M6036_02", 0.677},    // J2, J3
+    {"M4438_30", 0.5256},   // J5, J6, J7  (vendor motor_tqe_adj value)
+    // ---- legacy / other Hightorque models ----
     {"M3536_32", 0.458105},
-    {"M4438_30", 0.5256},
     {"M4438_32", 0.485565},
     {"M4538_19", 0.493835},
     {"M5043_20", 0.966},
@@ -359,11 +363,18 @@ std::vector<uint8_t> build_vel_acc_int16(int16_t vel, int16_t acc) {
 }
 
 std::vector<uint8_t> build_torque_int16(int16_t tqe) {
-    std::vector<uint8_t> p = {0x01, 0x00, 0x0a, 0x04, 0x06, 0x20, 0x00, 0x80};
-    p.push_back(0x00); p.push_back(0x00);            // vel = 0
-    push_le_i16(p, tqe);
-    // kp=NAN, kd=0, 最大力矩=NAN
-    p.insert(p.end(), {0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80});
+    // 与控制板固件 set_torque_int16 完全一致 (livelybot_fdcan.c):
+    //   模式 0x0A + mode2 子帧 (cmd=0x04, num=0x06, addr=0x20) 写 6 个 int16:
+    //   [pos=NAN, vel=0, tqe, kp=0, kd=0, maxtqe=NAN] -> 寄存器 0x20..0x25.
+    // ★ kp 必须为 0, 不能是 NAN(0x8000): kp=NAN 会让电机用未定义位置增益
+    //   去追位置, 即使 tqe=0 也会猛烈甩动 (旧版 bug).
+    std::vector<uint8_t> p = {0x01, 0x00, 0x0a, 0x04, 0x06, 0x20};
+    push_le_i16(p, NAN_INT16);   // pos = 无限制 (0x8000)
+    push_le_i16(p, 0);           // vel = 0
+    push_le_i16(p, tqe);         // tqe (前馈力矩 raw)
+    push_le_i16(p, 0);           // kp = 0  (纯力矩, 无位置增益)
+    push_le_i16(p, 0);           // kd = 0
+    push_le_i16(p, NAN_INT16);   // 最大力矩 = 无限制 (0x8000)
     p = append(std::move(p), query_subframe_int16());
     return canfd_pad(p);
 }
@@ -1124,8 +1135,11 @@ std::optional<MotorState> HightorqueSerial::set_torque(int motor_id, double tqe_
                                                        const std::string& motor_model) {
     double coeff = 1.0;
     if (auto it = TORQUE_COEFF.find(motor_model); it != TORQUE_COEFF.end()) coeff = it->second;
+    // Firmware torque LSB is (coeff * 0.01) Nm/count (matches vendor
+    // motor.cpp tqe_float2int: raw = Nm / (motor_tqe_adj * 0.01)). Without
+    // the *0.01 the raw is 100x too small -> arm under-drives / sags.
     const int16_t tqe_int = (coeff != 0.0)
-        ? saturate_to_i16(static_cast<long long>(tqe_nm / coeff)) : 0;
+        ? saturate_to_i16(static_cast<long long>(tqe_nm / (coeff * 0.01))) : 0;
     return control_call(
         [&](int can_id, double t) { return send_can_and_recv_(can_id, build_torque_int16(tqe_int), t); },
         motor_id);
@@ -1151,8 +1165,9 @@ std::optional<MotorState> HightorqueSerial::set_pos_vel_tqe_kp_kd(
     const auto [pos_t, flag] = apply_position_limit_(motor_id, to_turns(pos, unit));
     double coeff = 1.0;
     if (auto it = TORQUE_COEFF.find(motor_model); it != TORQUE_COEFF.end()) coeff = it->second;
+    // Firmware torque LSB is (coeff * 0.01) Nm/count (see set_torque note).
     const int16_t tqe_int = (coeff != 0.0)
-        ? saturate_to_i16(static_cast<long long>(tqe_nm / coeff)) : 0;
+        ? saturate_to_i16(static_cast<long long>(tqe_nm / (coeff * 0.01))) : 0;
     const int16_t kp_int  = static_cast<int16_t>(std::clamp<long long>(static_cast<long long>(kp),       0LL, 32767LL));
     const int16_t kd_int  = static_cast<int16_t>(std::clamp<long long>(static_cast<long long>(kd * 100), 0LL, 32767LL));
     auto st = control_call(

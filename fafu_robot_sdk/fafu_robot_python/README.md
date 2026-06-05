@@ -7,7 +7,8 @@
 你的脚本  ──Python──▶  FafuRobotController  ──pybind11──▶  HightorqueSerial (C++)  ──USB串口──▶  调试板
 ```
 
-> SDK 总览见上一级目录 [`../README.md`](../README.md)；构建 `.pyd` 见同级 [`../fafu_robot_cpp/README.md`](../fafu_robot_cpp/README.md)。
+> SDK 总览见上一级目录 [`../README.md`](../README.md)；构建 `.pyd` 见同级 [`../fafu_robot_cpp/README.md`](../fafu_robot_cpp/README.md)；
+> 架构 / 协议栈 / 动力学等实现细节见 [`../技术文档.md`](../技术文档.md)。
 
 ---
 
@@ -22,13 +23,20 @@ fafu_robot_python/
 ├── panthera_motor.cpXY-win_amd64.pyd   底层 C++ 绑定 (由 ../fafu_robot_cpp/ 构建)
 ├── serial_cmake.dll                    Windows 运行时依赖 (同上)
 ├── requirements.txt
+├── fafu_robot_description/             vendored follower URDF (FK/IK 用)
 ├── examples/
 │   └── visible_motion.py               视觉可见的最小运动 demo
 └── tests/
     ├── smoke_test.py                   无硬件环境检查
     ├── test_one_joint.py               单关节 ±5° 安全测试
     ├── test_fafu_motion_interactive.py 交互式菜单 (运动 / 夹爪 / 软限位 / 示教)
-    └── test_fafu_grasp_calibrate.py    力控抓取阈值标定
+    ├── test_fafu_grasp_calibrate.py    力控抓取阈值标定
+    ├── test_fafu_servo_j.py            servoJ 在线流式跟踪 + 看门狗
+    ├── test_fafu_kinematics.py         FK / IK + move_p / move_l 自检
+    ├── test_fafu_keyboard_cartesian.py 键盘笛卡尔 teleop
+    ├── test_fafu_gravity_only.py       纯重力补偿 (照搬厂商脚本)
+    ├── test_fafu_gravity_comp.py       重力+摩擦+阻抗 拖动示教
+    └── diag_*.py                       诊断脚本 (motors / hold_torque / torque_ramp)
 ```
 
 ---
@@ -121,6 +129,45 @@ arm.get_joint_velocities()                        # → numpy array, rad/s
 arm.get_motor_states()                            # → dict[int, MotorState]
 ```
 
+### servoJ（在线流式控制，100~200Hz）
+
+给上层在线规划 / teleop / 视觉伺服用，自带固件看门狗等四道安全防线：
+
+```python
+from fafu_robot_controller import ServoOpts
+arm.servo_start(ServoOpts(watchdog_ms=100, max_vel=1.5,
+                          max_step_rad=0.02, max_lag_rad=0.15))
+while running:
+    arm.servo_j(target_angles)                    # 非阻塞, 每 tick 调一次
+arm.servo_end(finish_mode="brake")                # 清看门狗 + 收尾
+arm.servo_lag_count()                             # 跟踪误差超限计数
+```
+
+### 笛卡尔运动 / FK·IK（需要 pinocchio）
+
+```python
+arm.setup_dynamics(motor_models=[...], eef_frame="tool_link")  # 先加载 URDF
+pos, rot = arm.get_pose()                         # 当前末端位姿 (返回元组)
+fk = arm.forward_kinematics(q)                    # FK → dict: position/rotation/rpy/transform/q
+q = arm.inverse_kinematics(fk["position"], fk["rotation"])     # IK (阻尼最小二乘+多初值)
+arm.move_p(pos, rot, speed=20)                    # 笛卡尔点到点
+arm.move_l(pos, rot, speed=20)                    # 笛卡尔直线 (SE3 测地线)
+```
+
+### 重力 / 摩擦补偿 + 拖动示教（需要 pinocchio）
+
+```python
+arm.setup_dynamics(motor_models=["M5036_02", "M6036_02", ...],
+                   tau_limit=[15,30,30,15,5,5], torque_scale=1.0)
+arm.get_gravity(q)                                # 重力项 G(q), Nm
+arm.gravity_compensation_step(friction=False)     # 单步纯重力 (照搬厂商)
+arm.start_gravity_compensation(...)               # 拖动示教 (K/B/I 阻抗软保持)
+arm.tau_to_raw(tau)                               # Nm → raw int16 (干跑预览)
+```
+
+> 动力学需要 `pinocchio`（Windows 建议 conda-forge / WSL）。未装时这些方法报清晰错误，
+> 其余功能（move_j / servo_j / 夹爪）照常工作。详见 `tests/test_fafu_gravity_*.py`。
+
 ### 夹爪（4 种调用方式）
 
 ```python
@@ -165,6 +212,9 @@ arm.emergency_stop() / arm.resume()
 | 3 | `python examples/visible_motion.py` | J2 / J4 / 夹爪都看得见动作 |
 | 4 | `python tests/test_fafu_motion_interactive.py --gripper-id 7` | 菜单驱动全功能跑一遍 |
 | 5 | `python tests/test_fafu_grasp_calibrate.py --gripper-id 7` | 拿到推荐的 `force_threshold` 数值 |
+| 6 | `python tests/test_fafu_servo_j.py` | servoJ 跟踪 sin 轨迹，lag/clamp 计数可控，看门狗生效 |
+| 7 | `python tests/test_fafu_kinematics.py` | FK→IK 往返自洽，`move_p` / `move_l` 落点误差达标 |
+| 8 | `python tests/test_fafu_gravity_only.py --dry-run` | 干跑看每关节力矩 / raw 量级合理（先确认再上真机） |
 
 ---
 
@@ -177,10 +227,12 @@ arm.emergency_stop() / arm.resume()
 |---|---|---|
 | `PiperArmController(can_name="can0")` | `FafuRobotController(cfg_path="robot.cfg")` | 一个走 CAN，一个走 USB→CAN-FD 调试板 |
 | `arm.move_j(angles, speed=...)` | 同名同语义 | ✅ |
-| `arm.move_p(...) / move_l(...)` | **NotImplementedError**（需要外置 IK / FK） | Fafu 调试板栈不带笛卡尔规划 |
+| `arm.move_p(...) / move_l(...)` | ✅ 已实现（Pinocchio FK/IK） | 需先 `setup_dynamics()` 加载 URDF + 装 `pinocchio` |
 | `arm.open_gripper(width)` | `arm.open_gripper(angle)` | Fafu 夹爪是旋转关节，单位是角度而非宽度 |
 | `arm.close_gripper(effort)` | `arm.close_gripper(effort=N)` | `effort` 在 Piper 是 N·m，在 Fafu 是 raw int16 |
 | ─ | `arm.grasp(force_threshold=...)` | Fafu 独有：Python 侧力矩监测+早停 |
+| ─ | `arm.servo_j(...)` + 看门狗 | Fafu 独有：在线流式控制（C++ 侧也有） |
+| ─ | `arm.start_gravity_compensation(...)` | Fafu 独有：重力/摩擦补偿拖动示教 |
 
 ---
 

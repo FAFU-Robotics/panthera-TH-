@@ -14,9 +14,11 @@ __pycache__/
 *.pyo
 *$py.class
 
-# ---- 构建目录 ----
+# ---- 构建目录 (含 build/, build310/, build_linux/ 等带后缀变体) ----
 build/
-*/build/
+build[_0-9]*/
+**/build/
+**/build[_0-9]*/
 
 # ---- MSVC / CMake 中间产物 ----
 *.obj
