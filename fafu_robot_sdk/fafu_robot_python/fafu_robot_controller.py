@@ -132,6 +132,13 @@ MODE_STOP     = 0x00   # PWM off, free to move by hand
 _VEL_AVG_MAX_TPS = 0.5    # absolute cap for average velocity (turns/s)
 _DT_MIN_S        = 0.3    # shortest segment time (s)
 _SETTLE_MS       = 300    # extra hold time after the trajectory ends
+# If the measured pose is within this of the last *commanded* pose we
+# treat the joint as "still held by us" and start the next trajectory
+# from the command (continuity).  Beyond it, something moved the joint
+# externally, so we start from the measured value instead.
+# 0.05 turns = 18 deg, comfortably larger than any steady-state error
+# but small enough to detect a real hand-drag.
+_CMD_CONTINUITY_TOL_T = 0.05
 
 # 1 turn = 2*pi rad
 _TWO_PI = 2.0 * math.pi
@@ -292,6 +299,22 @@ class ServoOpts:
     # Set ``lag_abort_consecutive > 0`` to opt back into auto-abort (handy
     # for production safety, but not for diagnostic scripts).
     lag_abort_consecutive: int = 0
+    # ---- control channel ----
+    # True (default): send on the group-MIT channel (0x8093, kp/kd + gravity
+    #   feed-forward, like move_MIT) -- impedance tracking, softer feel, matches
+    #   the vendor pos_vel_tqe_kp_kd streaming. Uses kp/kd (mit_kp/mit_kd) and,
+    #   for heavy joints, a dynamics model for gravity feed-forward.
+    # False: send on the position channel (0x8090 set_many_pos_vel_tqe_partial)
+    #   -- firmware position loop tracks; robust, no gain tuning (fallback).
+    use_mit: bool = True
+    # Per-joint MIT PD gains (physical vendor units, same as move_MIT). None =>
+    # vendor replay defaults for 6-DoF (kp=[30,40,55,15,7,5], kd=[3,4,5.5,1.5,
+    # 0.7,0.5]); scalar otherwise. Only used when use_mit=True.
+    mit_kp: "float | Iterable[float] | None" = None
+    mit_kd: "float | Iterable[float] | None" = None
+    # Add gravity feed-forward each MIT tick (needs setup_dynamics; silently
+    # falls back to kp/kd-only when no model). Only used when use_mit=True.
+    mit_gravity_ff: bool = True
 
 
 @dataclass
@@ -486,6 +509,17 @@ class FafuRobotController:
             except Exception as e:
                 print(f"[FafuRobot] warning: start_state_polling failed: {e}")
 
+        # Last *commanded* joint positions (turns) from a blocking
+        # move (S-curve).  Used to start the next move's trajectory from
+        # where the motor was last *told* to go, not from the measured
+        # position.  The two differ by the steady-state error (gravity /
+        # backlash on heavy joints like the shoulder); starting the new
+        # trajectory at the measured value re-commands that error as a
+        # step and makes the joint jerk in the wrong direction for one
+        # blink before the S-curve takes over.  Cleared whenever the
+        # commanded value becomes unknown (disable / manual drag).
+        self._last_cmd_turns: Optional[Dict[int, float]] = None
+
         # Servo (online streaming) session state. None when not servoing.
         self._servo_active: bool = False
         self._servo_opts: Optional[ServoOpts] = None
@@ -542,6 +576,13 @@ class FafuRobotController:
         self._dyn_torque_scale: np.ndarray = np.ones(self.num_joints)
         self._friction_params: Optional[FrictionParams] = None
         self._gravity_comp_active: bool = False
+        # Feed-forward torque channel for gravity/friction compensation:
+        #   True  -> group MIT (one 0x8093 frame, kp=kd=0), vendor-equivalent
+        #            pos_vel_tqe_kp_kd. Validated on this firmware (one-to-many
+        #            MIT is actuated; single-motor 0x15 is not).
+        #   False -> legacy per-joint set_torque (0x0A), one frame per joint.
+        # Auto-disabled when num_joints > 6 (one MIT frame holds <=6 motors).
+        self._use_group_mit: bool = (self.num_joints <= 6)
 
         print(
             f"[FafuRobot] connected on {self._port} @ {self._baudrate} "
@@ -736,6 +777,9 @@ class FafuRobotController:
 
     def disable(self) -> None:
         """Switch every motor to free-spin mode (mode ``0x00``)."""
+        # Commanded position is now meaningless (the user may hand-drag
+        # the arm); force the next move to start from the measured pose.
+        self._last_cmd_turns = None
         ok = self._switch_mode_all(self.MODE_STOP, label="stop", max_retry=2)
         if ok:
             print("[FafuRobot] all motors disabled (free spin).")
@@ -757,6 +801,9 @@ class FafuRobotController:
         speed: int = 50,
         block: bool = True,
         tolerance: float = 0.01,
+        style: str = "scurve",
+        duration: Optional[float] = None,
+        timeout: float = 10.0,
     ) -> None:
         """Move every manipulator joint to a target configuration.
 
@@ -783,12 +830,65 @@ class FafuRobotController:
             Joint tolerance for the *fast* one-shot blocking fallback
             used when TOPPRA / S-curve cannot run.  In radians (or
             degrees, matching ``is_radians``).  Defaults to ``0.01``.
+        style : {"scurve", "linear", "acc"}, optional
+            Trajectory style for ``block=True``:
+
+            * ``"scurve"`` (default): host-streamed cosine ease-in/out
+              profile via :meth:`_move_scurve` (smooth start/stop, uses
+              ``set_many_pos_vel_tqe`` == ``pos_vel_MAXtqe``, no
+              integral -> gravity steady-state error).
+            * ``"linear"``: official ``Panthera::jointsSyncArrival``
+              mimic — compute ``v_i = (target_i - current_i)/duration``
+              for synchronized arrival, broadcast **one**
+              ``set_many_pos_vel_tqe`` frame, then poll until settled
+              (:meth:`_move_linear_sync`).  Same ``pos_vel_MAXtqe`` path
+              (no integral) so the gravity steady-state error is
+              **identical** to S-curve; harder start/stop.  A/B only.
+            * ``"acc"``: per-joint ``set_pos_vel_acc`` (firmware
+              trapezoidal *internal* position loop, MODE_POS_VEL_ACC).
+              This is
+              the channel the firmware drives with its own profile +
+              (likely) integral action, so it is the one path that may
+              reduce the gravity steady-state error for free.  Single
+              shot per joint, then poll until settled
+              (:meth:`_move_acc_sync`).
+        duration : float, optional
+            Only used when ``style="linear"``.  Explicit move duration
+            (seconds).  When ``None`` it is derived from ``speed``.
+        timeout : float, optional
+            Only used when ``style="linear"`` and ``block=True``.  Max
+            seconds to wait for the joints to settle before giving up.
         """
         angles = self._validate_joint_angles(joint_angles, is_radians)
         targets_turns: Dict[int, float] = {
             mid: angles[i] for i, mid in enumerate(self._joint_motor_ids)
         }
         speed = self._clamp_speed(speed)
+
+        style = (style or "scurve").strip().lower()
+
+        if style == "linear":
+            tol_turns = abs(tolerance) / (_TWO_PI if is_radians else 360.0)
+            self._move_linear_sync(
+                targets_turns,
+                speed_pct=speed,
+                duration=duration,
+                tolerance_turns=tol_turns,
+                timeout_s=timeout,
+                block=block,
+            )
+            return
+
+        if style == "acc":
+            tol_turns = abs(tolerance) / (_TWO_PI if is_radians else 360.0)
+            self._move_acc_sync(
+                targets_turns,
+                speed_pct=speed,
+                tolerance_turns=tol_turns,
+                timeout_s=timeout,
+                block=block,
+            )
+            return
 
         if block:
             self._move_scurve(targets_turns, speed_pct=speed)
@@ -823,8 +923,20 @@ class FafuRobotController:
         start_frame_id: int = 1,
         speed: int = 50,
         control_frequency: float = 0.05,
+        kp: "float | Iterable[float] | None" = None,
+        kd: "float | Iterable[float] | None" = None,
+        gravity_ff: bool = True,
     ) -> None:
-        """Follow a joint-space waypoint path.
+        """Follow a joint-space waypoint path via **group MIT** streaming.
+
+        TOPPRA time-parametrises ``path`` into a dense, uniformly-spaced
+        (``control_frequency``) waypoint stream; each frame is then sent on
+        the one-to-many MIT channel (:meth:`move_MIT`, CAN ID ``0x8093``)
+        carrying per-joint **target position + velocity (finite-difference)
+        + gravity feed-forward + kp/kd**.  This replaces the earlier
+        ``move_j(block=False)`` firmware-position streaming: MIT tracking is
+        smoother (velocity feed-forward + gravity handled) and matches the
+        vendor's ``pos_vel_tqe_kp_kd`` trajectory playback.
 
         Parameters
         ----------
@@ -839,12 +951,20 @@ class FafuRobotController:
             Skip the first ``start_frame_id`` interpolated frames
             (typically used to skip the robot's current configuration).
         speed : int, optional
-            Speed percentage forwarded to each ``move_j`` call.
+            Kept for signature compatibility; **ignored** in MIT mode
+            (trajectory timing comes from TOPPRA + ``control_frequency``).
         control_frequency : float, optional
-            ``ctrl_freq`` value passed to TOPPRA (in seconds).  Note
-            that the original :mod:`piper` example also calls this
-            value ``control_frequency`` even though TOPPRA expects a
-            period (in seconds), not a rate.
+            ``ctrl_freq`` passed to TOPPRA (seconds); also the per-frame
+            stream period.
+        kp, kd : float or iterable, optional
+            Per-joint MIT PD gains in **physical vendor units** (see
+            :meth:`move_MIT`).  ``None`` (default) uses the vendor replay
+            gains for a 6-DoF arm (``kp=[30,40,55,15,7,5]``,
+            ``kd=[3,4,5.5,1.5,0.7,0.5]``); scalar otherwise.
+        gravity_ff : bool, optional
+            Add gravity feed-forward torque per frame (needs
+            :meth:`setup_dynamics`).  Default ``True``; silently falls back
+            to zero feed-forward (kp/kd-only tracking) when no model loaded.
 
         Raises
         ------
@@ -866,6 +986,12 @@ class FafuRobotController:
                 f"path must have shape (N, {self.num_joints}); got {path_arr.shape}"
             )
 
+        if self.num_joints > 6:
+            raise RuntimeError(
+                f"move_jntspace_path (MIT mode) needs <=6 joints, but "
+                f"num_joints={self.num_joints}. Exclude the gripper "
+                f"(gripper_motor_id) so only manipulator joints stream.")
+
         tpply = pwp.PiecewisePolyTOPPRA()
         interpolated = tpply.interpolate_by_max_spdacc(
             path=path_arr,
@@ -875,14 +1001,54 @@ class FafuRobotController:
             toggle_debug=False,
         )
         interpolated = interpolated[start_frame_id:]
+        if len(interpolated) == 0:
+            return
+
+        n = self.num_joints
+        # Default MIT gains = vendor replay values for a 6-DoF arm; scalar else.
+        if kp is None:
+            kp = ([30.0, 40.0, 55.0, 15.0, 7.0, 5.0][:n] if n == 6 else 20.0)
+        if kd is None:
+            kd = ([3.0, 4.0, 5.5, 1.5, 0.7, 0.5][:n] if n == 6 else 2.0)
+        if gravity_ff and not self.has_dynamics:
+            print("[FafuRobot] move_jntspace_path: gravity_ff requested but no "
+                  "dynamics model; streaming kp/kd only (setup_dynamics to add "
+                  "gravity feed-forward).")
+
+        # Make sure motors are in active (0x0A) mode so the 0x8093 MIT frame
+        # is actuated (position streaming left them here; brake/stop would not).
+        self.enable()
+
+        dt = max(0.005, control_frequency)
+        _to_rad = 1.0 if is_radians else (math.pi / 180.0)
+        prev = None
         for jnt_values in interpolated:
-            self.move_j(
-                joint_angles=jnt_values,
-                is_radians=is_radians,
-                speed=speed,
-                block=False,
-            )
-            time.sleep(max(0.005, control_frequency))
+            jv = np.asarray(jnt_values, dtype=float)
+            # Finite-difference velocity (same unit as jv: rad/s or deg/s).
+            vel = np.zeros(n) if prev is None else (jv - prev) / dt
+            prev = jv
+            if gravity_ff and self.has_dynamics:
+                tau = self.compute_compensation_torque(
+                    jv * _to_rad, vel * _to_rad, friction=False)
+            else:
+                tau = np.zeros(n)
+            self.move_MIT(
+                jv, vel, tau, kp=kp, kd=kd,
+                is_radians=is_radians, apply_torque_scale=True, timeout=0.0)
+            time.sleep(dt)
+        # Path done: the last MIT frame latches (kp holds final pose). Re-assert
+        # it briefly so the arm settles on target instead of coasting.
+        for _ in range(3):
+            jv = np.asarray(interpolated[-1], dtype=float)
+            if gravity_ff and self.has_dynamics:
+                tau = self.compute_compensation_torque(
+                    jv * _to_rad, np.zeros(n), friction=False)
+            else:
+                tau = np.zeros(n)
+            self.move_MIT(jv, np.zeros(n), tau, kp=kp, kd=kd,
+                          is_radians=is_radians, apply_torque_scale=True,
+                          timeout=0.0)
+            time.sleep(dt)
 
     # ------------------------------------------------------------------
     #  Servo (online streaming) control
@@ -973,6 +1139,11 @@ class FafuRobotController:
             except Exception as e:
                 raise RuntimeError(f"servo_start: enable_async_rx failed: {e}") from e
 
+        # A servo session moves motors outside the move_j S-curve, so any
+        # previously-cached commanded pose is no longer valid; force the
+        # next move_j to start from the measured pose.
+        self._last_cmd_turns = None
+
         # Capture current pos as last_target so the first servo_j is a
         # zero-step move and never trips the step-clamp warning.
         last_target: List[float] = []
@@ -1018,6 +1189,42 @@ class FafuRobotController:
                 except Exception as e:
                     print(f"[FafuRobot] servo_start: set_timeout({mid}) failed: {e}")
 
+        # If MIT channel requested, resolve + convert kp/kd to raw ONCE (per
+        # vendor kp_float2int, radian_2pi) so the per-tick hot path only does a
+        # cheap gravity-ff call + one set_many_mit. Physical gains default to
+        # the vendor replay values (6-DoF) or a scalar.
+        self._servo_mit_kp_raw: List[int] = []
+        self._servo_mit_kd_raw: List[int] = []
+        if opts.use_mit:
+            if self.num_joints > 6:
+                raise RuntimeError(
+                    f"servo use_mit needs <=6 joints, but num_joints="
+                    f"{self.num_joints}; exclude the gripper.")
+            kp = opts.mit_kp
+            kd = opts.mit_kd
+            nj = self.num_joints
+            if kp is None:
+                kp = ([30.0, 40.0, 55.0, 15.0, 7.0, 5.0][:nj] if nj == 6 else 20.0)
+            if kd is None:
+                kd = ([3.0, 4.0, 5.5, 1.5, 0.7, 0.5][:nj] if nj == 6 else 2.0)
+            kp_v = ([float(kp)] * nj if np.isscalar(kp)
+                    else [float(x) for x in kp])
+            kd_v = ([float(kd)] * nj if np.isscalar(kd)
+                    else [float(x) for x in kd])
+            for i in range(nj):
+                model = (self._dyn_motor_models[i]
+                         if self._dyn_motor_models is not None else "")
+                coeff = TORQUE_COEFF.get(model, 1.0) or 1.0
+                self._servo_mit_kp_raw.append(
+                    int(np.clip(round((kp_v[i] / coeff) * 10.0 * _TWO_PI),
+                                -32768, 32767)))
+                self._servo_mit_kd_raw.append(
+                    int(np.clip(round((kd_v[i] / coeff) * 10.0 * _TWO_PI),
+                                -32768, 32767)))
+            if opts.mit_gravity_ff and not self.has_dynamics:
+                print("[FafuRobot] servo_start: use_mit gravity_ff requested but "
+                      "no dynamics model; MIT will run kp/kd-only.")
+
         self._servo_opts = opts
         self._servo_last_target_turns = list(last_target)
         self._servo_filtered_target_turns = list(last_target)
@@ -1039,11 +1246,15 @@ class FafuRobotController:
         ff_tag = "on" if opts.feedforward_vel else "off"
         la_tag = (f"{opts.lookahead_time * 1000:.0f}ms"
                   if opts.lookahead_time > 0 else "off")
+        chan = ("MIT 0x8093 kp={} kd={} (raw)".format(
+                    self._servo_mit_kp_raw, self._servo_mit_kd_raw)
+                if opts.use_mit else "pos+vel+maxtqe 0x8090")
         print(
             f"[FafuRobot] servo_start: watchdog={opts.watchdog_ms}ms, "
             f"max_vel={opts.max_vel}rad/s, max_step={opts.max_step_rad}rad, "
             f"max_lag={opts.max_lag_rad}rad, "
-            f"feedforward={ff_tag}, lookahead={la_tag}, rate={opts.rate_hz:.0f}Hz"
+            f"feedforward={ff_tag}, lookahead={la_tag}, rate={opts.rate_hz:.0f}Hz, "
+            f"channel={chan}"
         )
 
     def servo_j(self, target_angles: Iterable[float]) -> bool:
@@ -1194,21 +1405,46 @@ class FafuRobotController:
 
         # (f) Defense 4 — soft limits handled inside set_many_pos_vel_tqe_partial.
 
-        # (g) One C++ call: active joints get (target, ff_vel); optional
-        # hold motors (never the gripper) get hold-at-cached-pos. Hot path is
-        # entirely C++ now: marshalling is 4x numpy memcpy (no Python
-        # ManyMotorCmd object construction), ~5us per tick.
+        # (g) Send one frame on the configured channel.
+        #   - default (use_mit=False): 0x8090 position+vel+maxtqe partial.
+        #     Firmware position loop tracks; hold motors held at cached pos.
+        #     Hot path is entirely C++ (numpy memcpy), ~5us per tick.
+        #   - use_mit=True: 0x8093 group MIT (kp/kd + gravity feed-forward).
+        #     pos/vel here are already in turns / turns-per-sec, exactly what
+        #     set_many_mit wants (PosUnit.Turns); kp/kd raw precomputed in
+        #     servo_start; gravity tau computed from the target pose each tick.
         try:
-            self._ht.set_many_pos_vel_tqe_partial(
-                self._servo_active_ids_np,
-                active_pos_buf,
-                active_vel_buf,
-                self._servo_max_torque,
-                self._servo_hold_ids_np,
-                pm.PosUnit.Turns,
-                self._servo_max_motor_id,
-                0.0,                    # async_rx is on, don't wait for replies
-            )
+            if opts.use_mit:
+                if opts.mit_gravity_ff and self.has_dynamics:
+                    q_rad = np.asarray(target_to_send, dtype=float) * _TWO_PI
+                    v_rad = active_vel_buf * _TWO_PI     # turns/s -> rad/s
+                    tau = self.compute_compensation_torque(
+                        q_rad, v_rad, friction=False) * self._dyn_torque_scale
+                    tau_raw = [int(x) for x in self.tau_to_raw(tau)]
+                else:
+                    tau_raw = [0] * self.num_joints
+                self._ht.set_many_mit(
+                    list(self._joint_motor_ids),
+                    [float(x) for x in active_pos_buf],
+                    [float(x) for x in active_vel_buf],
+                    tau_raw,
+                    self._servo_mit_kp_raw,
+                    self._servo_mit_kd_raw,
+                    pm.PosUnit.Turns,
+                    self._servo_max_motor_id,
+                    0.0,                # async_rx is on, don't wait for replies
+                )
+            else:
+                self._ht.set_many_pos_vel_tqe_partial(
+                    self._servo_active_ids_np,
+                    active_pos_buf,
+                    active_vel_buf,
+                    self._servo_max_torque,
+                    self._servo_hold_ids_np,
+                    pm.PosUnit.Turns,
+                    self._servo_max_motor_id,
+                    0.0,                # async_rx is on, don't wait for replies
+                )
         except Exception as e:
             print(f"[FafuRobot] servo_j: send failed: {e}")
             return False
@@ -2012,18 +2248,22 @@ class FafuRobotController:
     ) -> None:
         """Stream a feed-forward torque vector (Nm) to every joint motor.
 
-        Uses the pure-torque channel ``set_torque`` (firmware mode ``0x0A``,
-        frame matches the control-board ``set_torque_int16``: pos=NAN, vel=0,
-        kp=0, kd=0, maxtqe=NAN).  We deliberately do **not** use the MIT
-        ``set_pos_vel_tqe_kp_kd`` channel (mode ``0x15``): on this arm's motor
-        firmware mode ``0x15`` is not actuated (commands are silently ignored),
-        which is why gravity compensation previously produced "no force".
+        Channel (see :attr:`_use_group_mit`):
 
-        ``damping_kd`` is kept for API compatibility but has no firmware effect
-        on this channel; add velocity damping via the software impedance net
-        (``b_soft`` in :meth:`start_gravity_compensation`) instead.
+        * **Group MIT** (default when ``num_joints <= 6``): one one-to-many
+          ``set_many_mit`` frame (CAN ID ``0x8093``) with ``kp=kd=0``, i.e.
+          pure torque feed-forward.  This is the vendor-equivalent of
+          ``pos_vel_tqe_kp_kd(q, 0, tau, 0, 0)`` and is **validated on this
+          firmware** (the one-to-many MIT frame is actuated; the single-motor
+          ``0x15`` frame is not).
+        * **Legacy per-joint** (``num_joints > 6`` or ``_use_group_mit=False``):
+          one ``set_torque`` frame (mode ``0x0A``) per joint.
 
-        One CAN frame per joint; fine for the moderate-rate float loop.
+        Both send the identical feed-forward torque; only the CAN framing
+        differs.  ``damping_kd`` is kept for API compatibility but has no
+        firmware effect on either channel; add velocity damping via the
+        software impedance net (``b_soft`` in
+        :meth:`start_gravity_compensation`) instead.
         """
         tau = np.asarray(list(tau), dtype=float)
         if tau.shape != (self.num_joints,):
@@ -2031,6 +2271,29 @@ class FafuRobotController:
                 f"tau must have {self.num_joints} elements, got {tau.shape}")
         # Empirical calibration gain (1.0 by default).
         tau = tau * self._dyn_torque_scale
+
+        if self._use_group_mit and self.num_joints <= 6:
+            # One 0x8093 frame, kp=kd=0 => pure torque feed-forward. pos/vel
+            # are multiplied by 0 in-firmware so their value is irrelevant; send
+            # zeros. Pre-scaled tau -> raw here, so pass raw ints directly.
+            raw = self.tau_to_raw(tau)   # tau already * torque_scale above
+            zeros = [0.0] * self.num_joints
+            try:
+                self._ht.set_many_mit(
+                    list(self._joint_motor_ids),
+                    zeros, zeros,
+                    [int(x) for x in raw],
+                    [0] * self.num_joints,
+                    [0] * self.num_joints,
+                    pm.PosUnit.Radians,
+                    max(self._joint_motor_ids),
+                    0.0,
+                )
+            except Exception as e:
+                print(f"[FafuRobot] apply_compensation_torque (group MIT) "
+                      f"failed: {e}")
+            return
+
         for i, mid in enumerate(self._joint_motor_ids):
             model = (self._dyn_motor_models[i]
                      if self._dyn_motor_models is not None else "")
@@ -2039,6 +2302,149 @@ class FafuRobotController:
             except Exception as e:
                 print(f"[FafuRobot] apply_compensation_torque: motor {mid} "
                       f"failed: {e}")
+
+    def move_MIT(
+        self,
+        pos: Iterable[float],
+        vel: Iterable[float],
+        tau: Iterable[float],
+        kp: "float | Iterable[float]" = 0.0,
+        kd: "float | Iterable[float]" = 0.0,
+        *,
+        is_radians: bool = True,
+        apply_torque_scale: bool = True,
+        kp_kd_raw: bool = False,
+        timeout: float = 0.0,
+    ) -> Dict[int, "pm.MotorState"]:
+        """Stream one **group MIT** frame (CAN ID ``0x8093``) to J1..J6.
+
+        This is the vendor-equivalent of ``Panthera.pos_vel_tqe_kp_kd`` -- a
+        single one-to-many MIT/PD broadcast carrying, per joint::
+
+            tau_out = kp*(pos - q) + kd*(vel - qd) + tau_ff
+
+        Unlike the single-motor MIT channel (mode ``0x15``, silently ignored by
+        this arm's firmware), the *one-to-many* MIT frame (``0x8093``) **is**
+        actuated -- validated on hardware via ``diag_torque_ramp.py
+        --path mit-many`` (J1 spins up with rising raw torque).  So this is the
+        preferred channel for gravity comp / drag-teaching / replay.
+
+        Parameters
+        ----------
+        pos : iterable of float
+            Per-joint target position (radians by default). Feeds the MIT
+            position term; only matters when ``kp != 0``. Soft limits applied.
+        vel : iterable of float
+            Per-joint target velocity (rad/s by default). Only matters when
+            ``kd != 0``. Converted to turns/s internally.
+        tau : iterable of float
+            Per-joint feed-forward torque in **Nm** (e.g. gravity + friction).
+            Converted to raw int16 with the per-joint motor coeff, exactly like
+            :meth:`apply_compensation_torque`.
+        kp, kd : float or iterable of float
+            Per-joint PD gains in **physical vendor units** (same numbers as
+            ``Panthera.pos_vel_tqe_kp_kd``, e.g. replay
+            ``kp=[30,40,55,15,7,5]``, ``kd=[3,4,5.5,1.5,0.7,0.5]``).  Converted
+            to the firmware ``rkp``/``rkd`` int16 with the vendor formula
+            (``kp_float2int``, radian convention)::
+
+                raw = int16( (kp / coeff) * 10 * 2*pi )
+
+            where ``coeff`` is the joint's motor torque coefficient.  Scalar
+            broadcasts to every joint.  ``0`` (default) => pure torque
+            feed-forward (gravity comp on the group-MIT channel).  Pass
+            ``kp_kd_raw=True`` to skip the conversion and send raw int16 (used
+            by low-level diagnostics / :meth:`apply_compensation_torque`).
+        is_radians : bool
+            Interpret ``pos``/``vel`` as radians / rad/s (default) or deg / deg/s.
+        apply_torque_scale : bool
+            Multiply ``tau`` by the per-joint ``torque_scale`` calibration gain
+            (default ``True``, matches :meth:`apply_compensation_torque`).
+        kp_kd_raw : bool
+            When ``True`` treat ``kp``/``kd`` as already-raw int16 (skip the
+            vendor physical->raw conversion).  Default ``False``.
+        timeout : float
+            Reply-wait seconds. ``0`` (default) = fire-and-forget (fastest, for
+            high-rate loops); >0 blocks for state readback and returns it.
+
+        Returns
+        -------
+        dict[int, MotorState]
+            Motor states keyed by id when ``timeout > 0``; empty dict otherwise.
+
+        Notes
+        -----
+        One MIT frame holds at most **6 motors** (10 bytes each, CAN-FD 64 B
+        cap). This method sends the manipulator joints only; drive the gripper
+        separately (``gripper_control`` / group with <=6 total).
+        """
+        n = self.num_joints
+        if n > 6:
+            raise RuntimeError(
+                f"move_MIT: group MIT frame holds <=6 motors, but "
+                f"num_joints={n}. Use --gripper-id so the gripper is excluded, "
+                f"or drive extra joints on a separate frame.")
+        pos = np.asarray(list(pos), dtype=float)
+        vel = np.asarray(list(vel), dtype=float)
+        tau = np.asarray(list(tau), dtype=float)
+        for name, arr in (("pos", pos), ("vel", vel), ("tau", tau)):
+            if arr.shape != (n,):
+                raise ValueError(
+                    f"{name} must have {n} elements, got {arr.shape}")
+
+        def _as_vec(g) -> np.ndarray:
+            if np.isscalar(g):
+                return np.full(n, float(g))
+            g = np.asarray(list(g), dtype=float)
+            if g.shape != (n,):
+                raise ValueError(f"kp/kd must be scalar or {n} elements")
+            return g
+
+        kp_v = _as_vec(kp)
+        kd_v = _as_vec(kd)
+
+        if not kp_kd_raw:
+            # Vendor kp_float2int / kd_float2int (radian_2pi convention):
+            #   raw = int16( (gain / coeff) * 10 * 2*pi )
+            # coeff = per-joint torque coefficient (same table as tau_to_raw).
+            kp_raw = np.zeros(n)
+            kd_raw = np.zeros(n)
+            for i in range(n):
+                model = (self._dyn_motor_models[i]
+                         if self._dyn_motor_models is not None else "")
+                coeff = TORQUE_COEFF.get(model, 1.0) or 1.0
+                kp_raw[i] = (kp_v[i] / coeff) * 10.0 * _TWO_PI
+                kd_raw[i] = (kd_v[i] / coeff) * 10.0 * _TWO_PI
+            kp_v, kd_v = kp_raw, kd_raw
+
+        kp_out = [int(np.clip(round(x), -32768, 32767)) for x in kp_v]
+        kd_out = [int(np.clip(round(x), -32768, 32767)) for x in kd_v]
+
+        if apply_torque_scale:
+            tau = tau * self._dyn_torque_scale
+        tau_raw = self.tau_to_raw(tau)   # per-joint coeff * 0.01 -> int16
+
+        # pos: keep in the caller's unit and let the driver convert; vel: the
+        # driver wants turns/s, so convert from rad/s (or deg/s).
+        if is_radians:
+            unit = pm.PosUnit.Radians
+            vel_tps = vel / _TWO_PI
+        else:
+            unit = pm.PosUnit.Degrees
+            vel_tps = vel / 360.0
+
+        motor_ids = list(self._joint_motor_ids)
+        return self._ht.set_many_mit(
+            motor_ids,
+            [float(x) for x in pos],
+            [float(x) for x in vel_tps],
+            [int(x) for x in tau_raw],
+            kp_out,
+            kd_out,
+            unit,
+            max(motor_ids),
+            float(timeout),
+        )
 
     def gravity_compensation_step(
         self,
@@ -3627,18 +4033,33 @@ class FafuRobotController:
         v_avg_target = (speed_pct / 100.0) * _VEL_AVG_MAX_TPS
 
         # 1) capture starting positions for *every* motor (so we can
-        #    hold non-target ones, e.g. the gripper).
-        start_pos: Dict[int, float] = {}
+        #    hold non-target ones, e.g. the gripper).  Always query
+        #    fresh: after teach-record enable / hand-drag the cache
+        #    can be stale and the first S-curve tick will jerk.
+        meas_pos: Dict[int, float] = {}
         for mid in self._cfg.motor_ids:
-            s = self._ht.get_cached_state(mid)
-            if s is None:
-                s = self._ht.read_motor_state(mid, 0.1)
+            s = self._ht.read_motor_state(mid, 0.1)
             if s is None:
                 raise RuntimeError(
                     f"could not read motor {mid} starting position; "
                     f"aborting move_j for safety"
                 )
-            start_pos[mid] = s.position
+            meas_pos[mid] = s.position
+
+        # Prefer the *commanded* position from the previous blocking move
+        # as the trajectory start, so consecutive moves are continuous and
+        # we do not re-command the steady-state error as a step (which made
+        # heavy joints like J2 jerk the wrong way for one blink).  Fall back
+        # to the measured value when there is no trustworthy last command
+        # (first move, or measured drifted far from it -> hand-dragged /
+        # external disturbance).
+        start_pos: Dict[int, float] = {}
+        for mid in self._cfg.motor_ids:
+            cmd = (self._last_cmd_turns or {}).get(mid)
+            if cmd is not None and abs(cmd - meas_pos[mid]) <= _CMD_CONTINUITY_TOL_T:
+                start_pos[mid] = cmd
+            else:
+                start_pos[mid] = meas_pos[mid]
 
         # 2) adaptive segment time based on the largest delta.
         max_abs_dpos = 0.0
@@ -3707,9 +4128,217 @@ class FafuRobotController:
             stop_on_abort=True,
         )
         if rc == 1:
+            # Aborted mid-trajectory: the commanded position is no longer
+            # the planned target, so we cannot trust it for continuity.
+            self._last_cmd_turns = None
             raise RuntimeError("move_j aborted (abort_check returned True)")
         if rc == 2:
             print("[FafuRobot] warning: control loop exited abnormally")
+
+        # Remember what we last *commanded* every motor to, so the next
+        # blocking move can start continuously from here (see start_pos
+        # selection above).
+        last_cmd: Dict[int, float] = {}
+        for mid in self._cfg.motor_ids:
+            if mid in targets_turns:
+                last_cmd[mid] = targets_turns[mid]
+            else:
+                last_cmd[mid] = start_pos[mid]
+        self._last_cmd_turns = last_cmd
+
+    def _move_linear_sync(
+        self,
+        targets_turns: Dict[int, float],
+        *,
+        speed_pct: int,
+        duration: Optional[float] = None,
+        tolerance_turns: float = 0.01,
+        timeout_s: float = 10.0,
+        block: bool = True,
+        abort_check: Optional[Callable[[], bool]] = None,
+    ) -> None:
+        """Official-style synchronized *linear* move.
+
+        Faithful mimic of ``Panthera::jointsSyncArrival`` ->
+        ``posVelMaxTorque`` -> ``waitForPosition``:
+
+        1. read the current position of every motor,
+        2. pick ``v_i = (target_i - current_i) / duration`` so all joints
+           finish together,
+        3. broadcast **one** ``set_many_pos_vel_tqe`` frame (the motors'
+           on-board loop drives toward the target with that velocity as
+           feed-forward / target speed),
+        4. when ``block`` is ``True``, poll the measured positions until
+           every targeted joint is within ``tolerance_turns`` or
+           ``timeout_s`` elapses.
+
+        IMPORTANT: this uses the exact same ``pos_vel_MAXtqe`` (0x25) path
+        as the S-curve ``move_j`` — there is **no integral term**, so the
+        gravity steady-state error is identical.  It is provided only as an
+        A/B comparison against :meth:`_move_scurve`; it is *not* smoother
+        and does *not* reduce static error.
+        """
+        # 1) fresh current positions for every motor (so held motors can
+        #    keep their place, and so velocities are computed correctly).
+        meas_pos: Dict[int, float] = {}
+        for mid in self._cfg.motor_ids:
+            s = self._ht.read_motor_state(mid, 0.1)
+            if s is None:
+                raise RuntimeError(
+                    f"could not read motor {mid} starting position; "
+                    f"aborting move_j(style=linear) for safety"
+                )
+            meas_pos[mid] = s.position
+
+        # 2) duration: explicit, or derived from speed so the joint with
+        #    the largest delta travels at <= v_avg_target turns/s.
+        v_avg_target = (speed_pct / 100.0) * _VEL_AVG_MAX_TPS
+        max_abs_dpos = 0.0
+        for mid, tgt in targets_turns.items():
+            max_abs_dpos = max(max_abs_dpos, abs(float(tgt) - meas_pos[mid]))
+        if duration is None:
+            if max_abs_dpos < 1e-5:
+                dur = _DT_MIN_S
+            else:
+                dur = max(_DT_MIN_S, max_abs_dpos / max(v_avg_target, 1e-3))
+        else:
+            dur = max(_DT_MIN_S, float(duration))
+
+        # 3) v_i = (target - current) / duration; held motors stay put.
+        max_torque = int(self._cfg.max_torque_raw)
+        cmds: List[pm.ManyMotorCmd] = []
+        for mid in self._cfg.motor_ids:
+            if mid in targets_turns:
+                tgt = float(targets_turns[mid])
+                vel = (tgt - meas_pos[mid]) / dur
+                cmds.append(pm.ManyMotorCmd(mid, tgt, vel, max_torque))
+            else:
+                cmds.append(pm.ManyMotorCmd(mid, meas_pos[mid], 0.0, max_torque))
+
+        # one broadcast == posVelMaxTorque() + motor_send_cmd()
+        self._ht.set_many_pos_vel_tqe(
+            cmds, pm.PosUnit.Turns, max(self._cfg.motor_ids), 0.05,
+        )
+
+        last_cmd: Dict[int, float] = {}
+        for mid in self._cfg.motor_ids:
+            last_cmd[mid] = (
+                float(targets_turns[mid]) if mid in targets_turns else meas_pos[mid]
+            )
+
+        if not block:
+            self._last_cmd_turns = last_cmd
+            return
+
+        # 4) waitForPosition: poll until every targeted joint settles.
+        deadline = time.monotonic() + max(0.1, float(timeout_s))
+        reached = False
+        while time.monotonic() < deadline:
+            if abort_check is not None and abort_check():
+                self._last_cmd_turns = None
+                raise RuntimeError(
+                    "move_j(style=linear) aborted (abort_check returned True)"
+                )
+            ok = True
+            for mid, tgt in targets_turns.items():
+                s = self._ht.read_motor_state(mid, 0.1)
+                if s is None or abs(s.position - float(tgt)) > tolerance_turns:
+                    ok = False
+                    break
+            if ok:
+                reached = True
+                break
+            time.sleep(0.02)
+
+        if not reached:
+            print(
+                f"[FafuRobot] move_j(style=linear): not settled within "
+                f"{timeout_s:.1f}s (gravity steady-state error is expected on "
+                f"the pos_vel_MAXtqe path)."
+            )
+        self._last_cmd_turns = last_cmd
+
+    def _move_acc_sync(
+        self,
+        targets_turns: Dict[int, float],
+        *,
+        speed_pct: int,
+        acc_rpss: Optional[float] = None,
+        tolerance_turns: float = 0.01,
+        timeout_s: float = 10.0,
+        block: bool = True,
+        abort_check: Optional[Callable[[], bool]] = None,
+    ) -> None:
+        """Per-joint ``set_pos_vel_acc`` move (firmware trapezoidal loop).
+
+        Unlike the ``pos_vel_MAXtqe`` paths (``move_j`` S-curve / linear),
+        this commands each joint's **on-board** position profile
+        (MODE_POS_VEL_ACC: target pos + max velocity + acceleration).  The
+        firmware
+        runs its own profile generator and position loop, which on many
+        actuators includes an integral term — so this is the one path that
+        may shrink the gravity steady-state error *without* any torque
+        feed-forward / calibration.  Provided as an A/B test against the
+        ``pos_vel_MAXtqe`` paths.
+
+        One CAN frame per joint (no one-to-many ``set_pos_vel_acc`` exists),
+        all fired back-to-back; the firmware profiles handle synchronization
+        loosely (they finish near the same time because we share velocity /
+        acceleration caps).  Held / non-target motors are left untouched.
+        """
+        v_max = (speed_pct / 100.0) * _VEL_AVG_MAX_TPS
+        v_max = max(0.02, v_max)
+        # Acceleration cap: reach v_max in ~0.3 s by default (gentle ramp),
+        # so the start is not a hard step like style="linear".
+        acc = float(acc_rpss) if acc_rpss is not None else max(0.05, v_max / 0.3)
+
+        for mid, tgt in targets_turns.items():
+            try:
+                self._ht.set_pos_vel_acc(
+                    int(mid), float(tgt), float(v_max), float(acc),
+                    pm.PosUnit.Turns,
+                )
+            except Exception as e:
+                print(f"[FafuRobot] move_j(style=acc): motor {mid} failed: {e}")
+
+        last_cmd: Dict[int, float] = {}
+        cur = self._last_cmd_turns or {}
+        for mid in self._cfg.motor_ids:
+            if mid in targets_turns:
+                last_cmd[mid] = float(targets_turns[mid])
+            elif mid in cur:
+                last_cmd[mid] = cur[mid]
+
+        if not block:
+            self._last_cmd_turns = last_cmd or None
+            return
+
+        deadline = time.monotonic() + max(0.1, float(timeout_s))
+        reached = False
+        while time.monotonic() < deadline:
+            if abort_check is not None and abort_check():
+                self._last_cmd_turns = None
+                raise RuntimeError(
+                    "move_j(style=acc) aborted (abort_check returned True)"
+                )
+            ok = True
+            for mid, tgt in targets_turns.items():
+                s = self._ht.read_motor_state(mid, 0.1)
+                if s is None or abs(s.position - float(tgt)) > tolerance_turns:
+                    ok = False
+                    break
+            if ok:
+                reached = True
+                break
+            time.sleep(0.02)
+
+        if not reached:
+            print(
+                f"[FafuRobot] move_j(style=acc): not settled within "
+                f"{timeout_s:.1f}s (if the residual is still ~1 deg, the "
+                f"firmware acc loop has no integral either)."
+            )
+        self._last_cmd_turns = last_cmd or None
 
 
 # ============================================================================
@@ -3767,16 +4396,43 @@ if __name__ == "__main__":
             _print("\n--- Going home (joint zero) ---")
             arm.go_home(speed=args.speed, block=True)
 
-            _print("\n--- Tiny sinusoidal demo on the last joint (block=False) ---")
+            _print("\n--- Tiny sinusoidal demo (block=False) ---")
             base = arm.get_joint_values()
-            # When has_gripper=True the gripper motor is *not* in
-            # joint_motor_ids, so we drive J6 (the last manipulator
-            # joint).  When there is no gripper, the loop drives the
-            # 7th motor as before.
-            for i in range(40):
-                base[-1] = math.radians(10.0) * math.sin(i * math.pi / 20.0)
+            q0 = base.copy()
+            amp = math.radians(10.0)      # swing amplitude
+            margin = math.radians(2.0)    # keep this far inside soft limits
+
+            # Pick a joint whose [q0-amp, q0+amp] swing stays inside its
+            # soft limits.  This avoids the old bug of driving the last
+            # joint to an *absolute* +-10 deg around 0, which on this arm
+            # slams J7 into its soft limit (upper bound -1.836 deg).
+            lims = arm._joint_limits_rad()
+            demo_idx = None
+            # Prefer the wrist/last joints first, then fall back inward.
+            for idx in range(arm.num_joints - 1, -1, -1):
+                if lims is None:
+                    demo_idx = idx          # no limits known: trust the swing
+                    break
+                lo, hi = lims[0][idx], lims[1][idx]
+                if (q0[idx] - amp) >= (lo + margin) and \
+                   (q0[idx] + amp) <= (hi - margin):
+                    demo_idx = idx
+                    break
+
+            if demo_idx is None:
+                _print("  no joint has +-10 deg of room inside its soft "
+                       "limits at this pose; skipping the sinusoidal demo.")
+            else:
+                _print(f"  swinging J{demo_idx + 1} around its current angle "
+                       f"({math.degrees(q0[demo_idx]):+.1f} deg) by +-10 deg")
+                for i in range(40):
+                    # Oscillate *around the current angle*, not around 0.
+                    base[demo_idx] = q0[demo_idx] + amp * math.sin(i * math.pi / 20.0)
+                    arm.move_j(base, speed=args.speed, block=False)
+                    time.sleep(0.05)
+                # Return that joint to where it started.
+                base[demo_idx] = q0[demo_idx]
                 arm.move_j(base, speed=args.speed, block=False)
-                time.sleep(0.05)
 
             if has_gripper:
                 _print("\n--- Gripper demo (open -> close, using soft limits) ---")

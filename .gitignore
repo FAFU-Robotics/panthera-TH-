@@ -14,11 +14,9 @@ __pycache__/
 *.pyo
 *$py.class
 
-# ---- 构建目录 (含 build/, build310/, build_linux/ 等带后缀变体) ----
-build/
-build[_0-9]*/
-**/build/
-**/build[_0-9]*/
+# ---- 构建目录 (含 build/, build310/, build_linux/, build-py310 等带后缀变体) ----
+build*/
+**/build*/
 
 # ---- MSVC / CMake 中间产物 ----
 *.obj
@@ -69,6 +67,9 @@ panthera_web/last_run.log
 
 # ---- 备份压缩包 (源码已在仓库里, 不需要再存 zip) ----
 fafu_robot_sdk/fafu_robot_python.zip
+
+# ---- 运行时轨迹录制 (生成数据, 不进仓库) ----
+fafu_robot_sdk/fafu_robot_python/tests/recordings/
 
 # ---- 反规则: SDK 运行时分发产物保留 (绕开上面 *.py[cod] 把 .pyd 误命中) ----
 !fafu_robot_sdk/fafu_robot_python/panthera_motor.cp*-win_amd64.pyd

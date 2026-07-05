@@ -25,6 +25,7 @@ diag_torque_ramp.py
     cd fafu_robot_sdk/fafu_robot_python
     python tests/diag_torque_ramp.py --joint 1 --path torque --max-raw 200 --step 5
     python tests/diag_torque_ramp.py --joint 1 --path mit    --max-raw 200 --step 5
+    python tests/diag_torque_ramp.py --joint 1 --path mit-many --max-raw 200 --step 5
 """
 from __future__ import annotations
 
@@ -48,8 +49,11 @@ def main() -> int:
     parser.add_argument("--gripper-id", type=int, default=7)
     parser.add_argument("--joint", type=int, default=1,
                         help="1-based joint index (default 1 = J1 base, gravity-safe)")
-    parser.add_argument("--path", choices=["torque", "mit"], default="torque",
-                        help="torque=set_torque(0x0a); mit=set_pos_vel_tqe_kp_kd(0x15)")
+    parser.add_argument("--path", choices=["torque", "mit", "mit-many"],
+                        default="torque",
+                        help=("torque=set_torque(0x0a); "
+                              "mit=single set_pos_vel_tqe_kp_kd(0x15); "
+                              "mit-many=broadcast ID 0x8093"))
     parser.add_argument("--sign", type=float, default=1.0,
                         help="+1 or -1: torque direction")
     parser.add_argument("--max-raw", type=float, default=200.0,
@@ -86,10 +90,28 @@ def main() -> int:
         r = float(raw) * args.sign
         if args.path == "torque":
             drv.set_torque(mid, r, "")
-        else:
+        elif args.path == "mit":
             st = read_state()
             pos_t = st.position if st is not None else 0.0
             drv.set_pos_vel_tqe_kp_kd(mid, pos_t, 0.0, r, 0.0, 0.0, "", pm.PosUnit.Turns)
+        else:
+            st = read_state()
+            pos_t = st.position if st is not None else 0.0
+            if not hasattr(drv, "set_many_pos_vel_tqe_kp_kd_one"):
+                raise RuntimeError(
+                    "当前 panthera_motor.pyd 还没有 "
+                    "set_many_pos_vel_tqe_kp_kd_one; 请先重新编译 C++ 扩展")
+            # 一拖多 MIT/PD (ID=0x8093): 帧内每电机 10 字节, CAN-FD 单帧最大
+            # 64 字节 => 一帧最多 6 个电机. 诊断只测单关节, 槽位数只需覆盖到
+            # 被测电机 (mid) 即可, 前面的槽位自动填 0x8000 no-op.
+            # (J7 是夹爪, 不走 MIT; 它用 set_pos_vel_tqe 位置/速度/最大力矩.)
+            max_mid = mid
+            if raw <= 1e-9:
+                print(f"  [mit-many] mid={mid}, max_mid={max_mid}, "
+                      f"pos_t={pos_t:+.5f} turns")
+            drv.set_many_pos_vel_tqe_kp_kd_one(
+                mid, pos_t, 0.0, int(round(r)), 0, 0,
+                pm.PosUnit.Turns, max_mid, 0.05)
 
     def rehold():
         """把关节切回位置保持(按当前角), 避免松开下垂."""
@@ -108,8 +130,8 @@ def main() -> int:
             except Exception:
                 pass
 
-    if args.joint != 1 and args.path == "torque":
-        print("  ⚠ 你在用纯力矩通道测非 J1 关节. 若该关节受重力, raw=0 会甩落!")
+    if args.joint != 1 and args.path in ("torque", "mit", "mit-many"):
+        print("  ⚠ 你在测非 J1 关节. 若该关节受重力, raw=0/切换通道可能会甩落!")
         print("    请确认已摆到稳定平衡位并手扶住.")
 
     print()
@@ -118,6 +140,11 @@ def main() -> int:
           f"sign={args.sign:+.0f}, max_raw={args.max_raw}, "
           f"vel_abort={args.vel_abort}, max_dpos={args.max_dpos_deg}°")
     print("=" * 70)
+    if args.path == "mit-many":
+        print("  mit-many 使用协议文档的一拖多 MIT/PD 帧: CAN ID=0x8093, "
+              "[pos,vel,tqe,kp,kd]*N + 0x17 0x01")
+        print("  只填被测关节槽位, 其它电机槽位为 0x8000 no-op; kp=kd=0, "
+              "tqe_raw 直接使用 --max-raw/--step 的 raw 值.")
     try:
         input(" 确认安全后按 Enter 开始 (Ctrl+C 取消)... ")
     except KeyboardInterrupt:

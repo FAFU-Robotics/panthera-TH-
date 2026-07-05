@@ -367,6 +367,90 @@ PYBIND11_MODULE(panthera_motor, m) {
              py::arg("pos_unit") = PosUnit::Turns,
              py::arg("max_motor_id") = 0, py::arg("timeout_s") = 0.0)
 
+        .def("set_many_pos_vel_tqe_kp_kd_partial",
+             [](HightorqueSerial& self,
+                py::array_t<int,    py::array::c_style | py::array::forcecast> active_ids_arr,
+                py::array_t<double, py::array::c_style | py::array::forcecast> active_pos_arr,
+                py::array_t<double, py::array::c_style | py::array::forcecast> active_vel_arr,
+                int tqe_raw, int kp_raw, int kd_raw,
+                PosUnit pos_unit, int max_motor_id, double timeout_s) {
+                 if (active_ids_arr.ndim() != 1 || active_pos_arr.ndim() != 1 ||
+                     active_vel_arr.ndim() != 1) {
+                     throw std::runtime_error(
+                         "set_many_pos_vel_tqe_kp_kd_partial: 所有数组必须是 1-D");
+                 }
+                 const size_t n = static_cast<size_t>(active_ids_arr.shape(0));
+                 if (static_cast<size_t>(active_pos_arr.shape(0)) != n ||
+                     static_cast<size_t>(active_vel_arr.shape(0)) != n) {
+                     throw std::runtime_error(
+                         "set_many_pos_vel_tqe_kp_kd_partial: active_ids/pos/vel 长度必须一致");
+                 }
+                 std::vector<int>    active_ids(n);
+                 std::vector<double> active_pos(n);
+                 std::vector<double> active_vel(n);
+                 if (n) {
+                     std::memcpy(active_ids.data(), active_ids_arr.data(), n * sizeof(int));
+                     std::memcpy(active_pos.data(), active_pos_arr.data(), n * sizeof(double));
+                     std::memcpy(active_vel.data(), active_vel_arr.data(), n * sizeof(double));
+                 }
+                 const int16_t tqe_i16 = static_cast<int16_t>(
+                     std::clamp(tqe_raw, -32768, 32767));
+                 const int16_t kp_i16 = static_cast<int16_t>(
+                     std::clamp(kp_raw, -32768, 32767));
+                 const int16_t kd_i16 = static_cast<int16_t>(
+                     std::clamp(kd_raw, -32768, 32767));
+                 py::gil_scoped_release release;
+                 return self.set_many_pos_vel_tqe_kp_kd_partial(
+                     active_ids, active_pos, active_vel,
+                     tqe_i16, kp_i16, kd_i16, pos_unit, max_motor_id, timeout_s);
+             },
+             py::arg("active_ids"), py::arg("active_pos"), py::arg("active_vel"),
+             py::arg("tqe_raw"), py::arg("kp_raw"), py::arg("kd_raw"),
+             py::arg("pos_unit") = PosUnit::Turns,
+             py::arg("max_motor_id") = 0, py::arg("timeout_s") = 0.0)
+
+        .def("set_many_pos_vel_tqe_kp_kd_one",
+             [](HightorqueSerial& self,
+                int motor_id, double pos, double vel_rps,
+                int tqe_raw, int kp_raw, int kd_raw,
+                PosUnit pos_unit, int max_motor_id, double timeout_s) {
+                 // 一拖多 MIT/PD 单帧最多 6 个电机 (6*10+2=62 <= 64). 槽位数
+                 // 只需覆盖到被测电机即可, 不能盲目撑到 7 (会 72 字节溢出).
+                 if (max_motor_id < motor_id) max_motor_id = motor_id;
+                 if (max_motor_id <= 0 || max_motor_id > 6) {
+                     max_motor_id = std::min(std::max(motor_id, 1), 6);
+                 }
+                 const int16_t tqe_i16 = static_cast<int16_t>(
+                     std::clamp(tqe_raw, -32768, 32767));
+                 const int16_t kp_i16 = static_cast<int16_t>(
+                     std::clamp(kp_raw, -32768, 32767));
+                 const int16_t kd_i16 = static_cast<int16_t>(
+                     std::clamp(kd_raw, -32768, 32767));
+                 std::vector<int> active_ids{motor_id};
+                 std::vector<double> active_pos{pos};
+                 std::vector<double> active_vel{vel_rps};
+                 py::gil_scoped_release release;
+                 return self.set_many_pos_vel_tqe_kp_kd_partial(
+                     active_ids, active_pos, active_vel,
+                     tqe_i16, kp_i16, kd_i16, pos_unit, max_motor_id, timeout_s);
+             },
+             py::arg("motor_id"), py::arg("pos"), py::arg("vel_rps"),
+             py::arg("tqe_raw"), py::arg("kp_raw"), py::arg("kd_raw"),
+             py::arg("pos_unit") = PosUnit::Turns,
+             py::arg("max_motor_id") = 0, py::arg("timeout_s") = 0.0)
+
+        // ★ 每关节独立 tqe/kp/kd 的一拖多 MIT (CAN ID 0x8093).
+        //   Python 端传 list/ndarray 均可 (stl.h 自动转 std::vector):
+        //     ht.set_many_mit([1,2,3,4,5,6], pos, vel, tqe_raw, kp_raw, kd_raw,
+        //                     pos_unit=PosUnit.Radians, max_motor_id=6)
+        //   tqe/kp/kd 为原始 int16; 单帧最多 6 个电机.
+        .def("set_many_mit", &HightorqueSerial::set_many_mit,
+             py::arg("motor_ids"), py::arg("pos"), py::arg("vel_rps"),
+             py::arg("tqe_raw"), py::arg("kp_raw"), py::arg("kd_raw"),
+             py::arg("pos_unit") = PosUnit::Turns,
+             py::arg("max_motor_id") = 0, py::arg("timeout_s") = 0.05,
+             py::call_guard<py::gil_scoped_release>())
+
         .def("set_torque",  &HightorqueSerial::set_torque,
              py::arg("motor_id"), py::arg("tqe_nm"), py::arg("motor_model") = "",
              py::call_guard<py::gil_scoped_release>())

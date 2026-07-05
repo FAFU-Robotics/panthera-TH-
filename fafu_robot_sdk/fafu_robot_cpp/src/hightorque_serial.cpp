@@ -447,6 +447,48 @@ std::vector<uint8_t> build_many_pos_vel_tqe_int16(const std::vector<int16_t>& po
     return data;
 }
 
+std::vector<uint8_t> build_many_pos_vel_tqe_kp_kd_int16(
+        const std::vector<int16_t>& pos_arr,
+        const std::vector<int16_t>& vel_arr,
+        const std::vector<int16_t>& tqe_arr,
+        const std::vector<int16_t>& kp_arr,
+        const std::vector<int16_t>& kd_arr) {
+    if (pos_arr.size() != vel_arr.size() || pos_arr.size() != tqe_arr.size() ||
+        pos_arr.size() != kp_arr.size()  || pos_arr.size() != kd_arr.size()) {
+        throw std::invalid_argument(
+            "build_many_pos_vel_tqe_kp_kd_int16: pos/vel/tqe/kp/kd size mismatch");
+    }
+    const std::size_t n = pos_arr.size();
+
+    std::vector<uint8_t> data;
+    data.reserve(n * 10 + 16);
+    for (std::size_t i = 0; i < n; ++i) {
+        push_le_i16(data, pos_arr[i]);
+        push_le_i16(data, vel_arr[i]);
+        push_le_i16(data, tqe_arr[i]);
+        push_le_i16(data, kp_arr[i]);
+        push_le_i16(data, kd_arr[i]);
+    }
+
+    const std::size_t need = data.size() + 2;
+    // 一拖多 MIT/PD 每电机 10 字节 (pos/vel/tqe/kp/kd), CAN-FD 单帧数据段最大
+    // 64 字节, 所以一帧最多 6 个电机 (6*10+2=62). 超了必须报错, 否则下面
+    // target-need 会下溢成巨大值 -> "vector too long".
+    if (need > 64) {
+        throw std::invalid_argument(
+            "build_many_pos_vel_tqe_kp_kd_int16: frame > 64 bytes "
+            "(一拖多 MIT/PD 单帧最多 6 个电机; 减少 max_motor_id / 槽位数)");
+    }
+    std::size_t target = 64;
+    for (std::size_t s : CANFD_DLC_SIZES) {
+        if (s >= need) { target = s; break; }
+    }
+    data.insert(data.end(), target - need, PADDING);
+    data.push_back(0x17);
+    data.push_back(0x01);
+    return data;
+}
+
 std::vector<uint8_t> build_motor_reset() {
     return {0x40, 0x01, 0x08, 0x64, 0x20, 0x72, 0x65, 0x73,
             0x65, 0x74, 0x0A, 0x50};
@@ -1116,6 +1158,150 @@ std::map<int, MotorState> HightorqueSerial::set_many_pos_vel_tqe_partial(
     }
 
     auto replies = send_can_and_recv_(0x8090, data, timeout_s, expected);
+    for (auto& [rid, rdata] : replies) {
+        int motor_id = (rid >> 8) & 0x7F;
+        if (motor_id == 0) motor_id = rid & 0x7F;
+        if (motor_id < 1 || motor_id > n_slots) continue;
+        if (auto st = parse_motor_state_int16(rdata)) {
+            st->id = motor_id;
+            if (auto it = limit_flags.find(motor_id); it != limit_flags.end()) {
+                st->pos_limit_flag = it->second;
+            }
+            out[motor_id] = *st;
+        }
+    }
+    return out;
+}
+
+std::map<int, MotorState> HightorqueSerial::set_many_pos_vel_tqe_kp_kd_partial(
+        const std::vector<int>&    active_ids,
+        const std::vector<double>& active_pos,
+        const std::vector<double>& active_vel,
+        int16_t                    tqe_raw,
+        int16_t                    kp_raw,
+        int16_t                    kd_raw,
+        PosUnit pos_unit, int max_motor_id, double timeout_s) {
+
+    std::map<int, MotorState> out;
+    if (active_ids.size() != active_pos.size() ||
+        active_ids.size() != active_vel.size()) {
+        return out;
+    }
+    if (active_ids.empty()) return out;
+
+    int n_slots = max_motor_id;
+    if (n_slots <= 0) {
+        for (int id : active_ids) n_slots = std::max(n_slots, id);
+    }
+    if (n_slots <= 0) return out;
+
+    std::vector<int16_t> pos_arr(n_slots, NAN_INT16);
+    std::vector<int16_t> vel_arr(n_slots, NAN_INT16);
+    std::vector<int16_t> tqe_arr(n_slots, NAN_INT16);
+    std::vector<int16_t> kp_arr(n_slots, NAN_INT16);
+    std::vector<int16_t> kd_arr(n_slots, NAN_INT16);
+
+    std::map<int, int> limit_flags;
+    int expected = 0;
+    for (size_t k = 0; k < active_ids.size(); ++k) {
+        const int mid = active_ids[k];
+        if (mid < 1 || mid > n_slots) continue;
+
+        const auto [pos_t, flag] = apply_position_limit_(mid, to_turns(active_pos[k], pos_unit));
+        limit_flags[mid] = flag;
+
+        const std::size_t idx = static_cast<std::size_t>(mid - 1);
+        pos_arr[idx] = turns_to_int16(pos_t);
+        vel_arr[idx] = rps_to_int16(active_vel[k]);
+        tqe_arr[idx] = tqe_raw;
+        kp_arr[idx]  = kp_raw;
+        kd_arr[idx]  = kd_raw;
+        ++expected;
+    }
+
+    const auto data = build_many_pos_vel_tqe_kp_kd_int16(
+        pos_arr, vel_arr, tqe_arr, kp_arr, kd_arr);
+    if (timeout_s <= 0.0 || expected <= 0) {
+        (void)send_can_and_recv_(0x8093, data, 0.0, 0);
+        return out;
+    }
+
+    auto replies = send_can_and_recv_(0x8093, data, timeout_s, expected);
+    for (auto& [rid, rdata] : replies) {
+        int motor_id = (rid >> 8) & 0x7F;
+        if (motor_id == 0) motor_id = rid & 0x7F;
+        if (motor_id < 1 || motor_id > n_slots) continue;
+        if (auto st = parse_motor_state_int16(rdata)) {
+            st->id = motor_id;
+            if (auto it = limit_flags.find(motor_id); it != limit_flags.end()) {
+                st->pos_limit_flag = it->second;
+            }
+            out[motor_id] = *st;
+        }
+    }
+    return out;
+}
+
+std::map<int, MotorState> HightorqueSerial::set_many_mit(
+        const std::vector<int>&    motor_ids,
+        const std::vector<double>& pos,
+        const std::vector<double>& vel_rps,
+        const std::vector<int>&    tqe_raw,
+        const std::vector<int>&    kp_raw,
+        const std::vector<int>&    kd_raw,
+        PosUnit pos_unit, int max_motor_id, double timeout_s) {
+
+    // 每关节独立 tqe/kp/kd 的一拖多 MIT (CAN ID 0x8093). tqe/kp/kd 均为
+    // 原始 int16, 不做 Nm / 增益换算 (上层负责转换, 见 diag_torque_ramp
+    // 已在硬件上验证的 raw 语义). pos 走软限位; vel 单位 turns/s.
+    // 帧内每电机 10 字节, 单帧最多 6 个电机 (build 函数会对 >64B 抛错).
+    std::map<int, MotorState> out;
+    const std::size_t n = motor_ids.size();
+    if (pos.size() != n || vel_rps.size() != n || tqe_raw.size() != n ||
+        kp_raw.size() != n || kd_raw.size() != n) {
+        throw std::invalid_argument(
+            "set_many_mit: motor_ids/pos/vel/tqe/kp/kd 长度必须一致");
+    }
+    if (n == 0) return out;
+
+    int n_slots = max_motor_id;
+    if (n_slots <= 0) {
+        for (int id : motor_ids) n_slots = std::max(n_slots, id);
+    }
+    if (n_slots <= 0) return out;
+
+    std::vector<int16_t> pos_arr(n_slots, NAN_INT16);
+    std::vector<int16_t> vel_arr(n_slots, NAN_INT16);
+    std::vector<int16_t> tqe_arr(n_slots, NAN_INT16);
+    std::vector<int16_t> kp_arr(n_slots, NAN_INT16);
+    std::vector<int16_t> kd_arr(n_slots, NAN_INT16);
+
+    std::map<int, int> limit_flags;
+    int expected = 0;
+    for (std::size_t k = 0; k < n; ++k) {
+        const int mid = motor_ids[k];
+        if (mid < 1 || mid > n_slots) continue;
+
+        const auto [pos_t, flag] = apply_position_limit_(mid, to_turns(pos[k], pos_unit));
+        limit_flags[mid] = flag;
+
+        const std::size_t idx = static_cast<std::size_t>(mid - 1);
+        pos_arr[idx] = turns_to_int16(pos_t);
+        vel_arr[idx] = rps_to_int16(vel_rps[k]);
+        tqe_arr[idx] = saturate_to_i16(static_cast<long long>(tqe_raw[k]));
+        kp_arr[idx]  = saturate_to_i16(static_cast<long long>(kp_raw[k]));
+        kd_arr[idx]  = saturate_to_i16(static_cast<long long>(kd_raw[k]));
+        ++expected;
+    }
+
+    const auto data = build_many_pos_vel_tqe_kp_kd_int16(
+        pos_arr, vel_arr, tqe_arr, kp_arr, kd_arr);
+    if (timeout_s <= 0.0 || expected <= 0) {
+        (void)send_can_and_recv_(0x8093, data, 0.0, 0);
+        return out;
+    }
+
+    auto replies = send_can_and_recv_(0x8093, data, timeout_s, expected);
     for (auto& [rid, rdata] : replies) {
         int motor_id = (rid >> 8) & 0x7F;
         if (motor_id == 0) motor_id = rid & 0x7F;

@@ -403,6 +403,37 @@ public:
         int     max_motor_id = 0,
         double  timeout_s    = 0.0);
 
+    // 一拖多 MIT/PD 诊断路径 (CAN ID 0x8093). 与协议文档的
+    // motor_many_pos_vel_tqe_kp_kd_2 格式一致:
+    // [pos, vel, tqe, kp, kd] * motor_slot + [0x17, 0x01].
+    // tqe/kp/kd 均为 raw int16, 不做 Nm 或增益单位换算.
+    std::map<int, MotorState> set_many_pos_vel_tqe_kp_kd_partial(
+        const std::vector<int>&    active_ids,
+        const std::vector<double>& active_pos,
+        const std::vector<double>& active_vel,
+        int16_t                    tqe_raw,
+        int16_t                    kp_raw,
+        int16_t                    kd_raw,
+        PosUnit pos_unit     = PosUnit::Turns,
+        int     max_motor_id = 0,
+        double  timeout_s    = 0.0);
+
+    // ★ 每关节独立 tqe/kp/kd 的一拖多 MIT (CAN ID 0x8093). 这是重力补偿 /
+    //   拖动示教 / 回放的正式底层通道 (官方 pos_vel_tqe_kp_kd 的一拖多等价).
+    //   motor_ids/pos/vel_rps/tqe_raw/kp_raw/kd_raw 同长度 N (逐关节).
+    //   tqe/kp/kd 为原始 int16 (上层负责 Nm/增益换算); pos 走软限位, vel=turns/s.
+    //   单帧最多 6 个电机 (每电机 10 字节, >64B build 函数抛错).
+    std::map<int, MotorState> set_many_mit(
+        const std::vector<int>&    motor_ids,
+        const std::vector<double>& pos,
+        const std::vector<double>& vel_rps,
+        const std::vector<int>&    tqe_raw,
+        const std::vector<int>&    kp_raw,
+        const std::vector<int>&    kd_raw,
+        PosUnit pos_unit     = PosUnit::Turns,
+        int     max_motor_id = 0,
+        double  timeout_s    = 0.05);
+
     // motor_model 用于查 TORQUE_COEFF 表换算 Nm; 留空则当作系数 1.0
     std::optional<MotorState> set_torque(int motor_id, double tqe_nm,
                                          const std::string& motor_model = "");
