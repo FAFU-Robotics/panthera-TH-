@@ -120,6 +120,25 @@ cmake -S . -B build \
 cmake --build build --config Release -j
 ```
 
+## Ubuntu / Linux
+
+**推荐**：用 `linux/` 子目录里的一键脚本，涵盖装依赖、USB udev、libserial_cmake.so
+Linux fixup、servoJ 实时优先级等 Ubuntu 专属配套。详见 [`linux/README.md`](linux/README.md)。
+
+```bash
+cd fafu_robot_sdk/fafu_robot_cpp
+bash linux/install_deps.sh          # apt 装 build-essential/cmake/python3-dev + pip 装 pybind11
+bash linux/setup_udev.sh            # (推荐) 装 udev 规则, 免 sudo 访问 USB 串口
+bash linux/build.sh                 # 编 panthera_motor.so + 静态库 + 4 个例程到 build_linux/
+./build_linux/bin/01_smoke          # 最小连通性测试
+```
+
+> **⚠ Linux 特有的 fixup**：当前 CMakeLists 的 POST_BUILD 只在 `if(WIN32)` 分支
+> 复制 `serial_cmake.dll` 到 `../fafu_robot_python/`。Linux 下这一步漏掉，
+> `import panthera_motor` 会报 `libserial_cmake.so: cannot open shared object file`。
+> `linux/build.sh` 已经在编译后自动补做：`cp libserial_cmake.so` +
+> `patchelf --set-rpath '$ORIGIN'`。
+
 可选 cmake 参数:
 
 | 参数 | 默认值 | 含义 |

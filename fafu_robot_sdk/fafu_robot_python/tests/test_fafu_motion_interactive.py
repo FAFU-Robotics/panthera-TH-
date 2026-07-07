@@ -466,6 +466,84 @@ class App:
 
     # ----- 单关节运动 -----
 
+    def _move_MIT_to(self, target_rad, speed: int) -> bool:
+        """用 servo_j (默认 MIT 通道) 平滑逼近目标, 到位后切固件位置模式锁定.
+
+        - 逼近: servo_j 自带单步限幅 (max_step_rad), 反复喂同一目标即匀速逼近,
+          无需自己做轨迹规划; 自带看门狗/限幅/软限位等安全防线. MIT 通道
+          (kp/kd + 重力前馈) 运动手感柔.
+        - 锁定: MIT 是 PD 控制无积分项, 长期静态保持会有稳态误差(重关节下垂).
+          所以到位后用 move_j (固件位置模式, 带积分) 把它锁死 -> 不下垂.
+          (若因故没到位/被中断, 则不强行锁定, 保持当前.)
+        """
+        from fafu_robot_controller import ServoOpts
+
+        self._ensure_dynamics()      # 有动力学 -> MIT 带重力前馈; 无则 kp/kd-only
+
+        target = np.asarray(target_rad, dtype=float)
+        q0 = np.asarray(self.arm.get_joint_values(), dtype=float)
+        max_dq = float(np.max(np.abs(target - q0)))
+        if max_dq < math.radians(0.1):
+            print("  已在目标位姿附近, 无需移动")
+            return True
+
+        # speed% -> 逼近角速度 (100% ≈ 90°/s). 每 tick 步长 = vel/rate, 决定快慢.
+        rate = 100.0
+        vel_rad_s = max(0.05, (speed / 100.0) * math.radians(90.0))
+        opts = ServoOpts(
+            watchdog_ms=100, rate_hz=rate,
+            max_vel=vel_rad_s * 1.5,
+            max_step_rad=vel_rad_s / rate,          # 逼近速度的真正上限
+            max_lag_rad=math.radians(30.0),
+            is_radians=True,                        # use_mit 默认 True -> 走 MIT
+        )
+        dt = 1.0 / rate
+        # 逼近容差放宽 (2°): MIT(PD无积分)+本固件 kp 偏弱, 重关节会卡在离目标
+        # 几度的平衡点合不拢, 强等它精确到位只会一直超时. 让它"接近"即可,
+        # 最后统一交给 move_j 收口. 逼近段以行程时间定上限, 到点/停滞就结束.
+        tol = math.radians(2.0)
+        deadline = time.monotonic() + max(3.0, max_dq / vel_rad_s + 2.0)
+
+        print(f"  servo_j(MIT) 逼近目标 (speed={speed}%, "
+              f"~{math.degrees(vel_rad_s):.0f}°/s)")
+        self.arm.servo_start(opts)
+        settle = 0
+        interrupted = False
+        try:
+            while True:
+                self.arm.servo_j(target)
+                cur = np.asarray(
+                    self.arm.get_joint_values(prefer_cache=True), dtype=float)
+                if float(np.max(np.abs(cur - target))) <= tol:
+                    settle += 1
+                    if settle >= 5:                 # 连续接近几拍就结束逼近段
+                        break
+                else:
+                    settle = 0
+                if time.monotonic() > deadline:
+                    break
+                time.sleep(dt)
+        except KeyboardInterrupt:
+            interrupted = True
+            print("\n  [中断]")
+        finally:
+            self.arm.servo_end("hold")
+
+        # 收尾: 用 move_j (固件位置模式, 带积分) 精确到位并锁死 -> 无 MIT PD 下垂.
+        # MIT 逼近做柔顺运动, move_j 负责最后合拢 + 长期保持. Ctrl+C 中断则不
+        # 强行到位, 直接刹车停在当前.
+        if interrupted:
+            try:
+                self.arm.brake()
+            except Exception:
+                pass
+            return True
+        try:
+            self.arm.move_j(target, speed=max(5, speed), block=True)
+        except Exception as e:
+            print(f"  位置锁定失败 (仍以 MIT 保持): {e}")
+        return True
+
     def move_one_joint(self):
         n = self.arm.num_joints
         s = prompt(f"  动哪个关节 (0..{n - 1}, 默认 {n - 1}): ")
@@ -493,15 +571,14 @@ class App:
         if not yes(prompt("  执行? [Y/n]: ")):
             print("  取消."); return
         try:
-            self.arm.move_j(target, speed=speed, block=True, style=self.move_style)
+            self._move_MIT_to(target, speed)
         except Exception as e:
             traceback.print_exc()
             print(f"  [失败] {e}"); return
         time.sleep(0.2)
         q1 = self.arm.get_joint_values()
         err = math.degrees(q1[idx] - target[idx])
-        print(f"  到位 (deg): {deg_str(q1)}  关节 {idx} 误差 {err:+.3f}°  "
-              f"[style={self.move_style}]")
+        print(f"  到位 (deg): {deg_str(q1)}  关节 {idx} 误差 {err:+.3f}° [MIT]")
 
     # ----- 多关节运动 -----
 
@@ -526,13 +603,13 @@ class App:
         if not yes(prompt("  执行? [Y/n]: ")):
             print("  取消."); return
         try:
-            self.arm.move_j(target, speed=speed, block=True, style=self.move_style)
+            self._move_MIT_to(target, speed)
         except Exception as e:
             traceback.print_exc()
             print(f"  [失败] {e}"); return
         time.sleep(0.2)
         q1 = self.arm.get_joint_values()
-        print(f"  到位 (deg): {deg_str(q1)}  [style={self.move_style}]")
+        print(f"  到位 (deg): {deg_str(q1)}  [MIT]")
         print(f"  各关节误差 (deg): {deg_str(np.asarray(q1) - np.asarray(target))}")
 
     def go_home(self):

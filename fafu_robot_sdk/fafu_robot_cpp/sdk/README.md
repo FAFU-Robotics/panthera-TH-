@@ -62,6 +62,20 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ^
 cmake --build build --config Release -j
 ```
 
+Ubuntu / Linux 一键 (装依赖 + 编 SDK + 例程):
+
+```bash
+bash ../linux/install_deps.sh --no-pybind11    # 不要 pybind11 时加这个
+bash ../linux/build.sh --no-python             # 只编原生 SDK + 4 个例程
+./../build_linux/bin/01_smoke                  # 最小连通性测试
+
+# servoJ (04_servo_j) 强烈建议配 SCHED_FIFO 减抖:
+sudo setcap cap_sys_nice=eip ../build_linux/bin/04_servo_j
+bash ../linux/run_rt.sh 04_servo_j
+```
+
+完整说明见 [`../linux/README.md`](../linux/README.md).
+
 可选 CMake 选项:
 
 | 选项 | 默认 | 含义 |

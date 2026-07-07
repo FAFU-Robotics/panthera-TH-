@@ -1195,6 +1195,9 @@ class FafuRobotController:
         # the vendor replay values (6-DoF) or a scalar.
         self._servo_mit_kp_raw: List[int] = []
         self._servo_mit_kd_raw: List[int] = []
+        # MIT frame slot count = max JOINT motor id (gripper excluded), so a
+        # 6-joint arm builds a 6-slot 62B frame, not a 7-slot 72B (>64) one.
+        self._servo_mit_max_motor_id = int(max(self._joint_motor_ids))
         if opts.use_mit:
             if self.num_joints > 6:
                 raise RuntimeError(
@@ -1431,7 +1434,10 @@ class FafuRobotController:
                     self._servo_mit_kp_raw,
                     self._servo_mit_kd_raw,
                     pm.PosUnit.Turns,
-                    self._servo_max_motor_id,
+                    # MIT frame holds joints only (gripper excluded); slot count
+                    # must be max JOINT id, NOT max of all motor_ids (which
+                    # includes M7 gripper -> 7 slots -> 72B > 64B frame error).
+                    self._servo_mit_max_motor_id,
                     0.0,                # async_rx is on, don't wait for replies
                 )
             else:
